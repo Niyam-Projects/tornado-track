@@ -1,0 +1,108 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Tornado Track Model — Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ---------------------------------------------------------------------------
+# Data paths  (DATA_ROOT is the only path that needs to change per machine)
+# ---------------------------------------------------------------------------
+data:
+  root: "E:\\projects\\tornado-track"        # Hardcoded local data root
+  dat_dir: "E:\\projects\\tornado-track\\dat"
+  events_dir: "E:\\projects\\tornado-track\\events"
+  checkpoints_dir: "E:\\projects\\tornado-track\\checkpoints"
+  reports_dir: "E:\\projects\\tornado-track\\reports"
+  index_path: "E:\\projects\\tornado-track\\index.parquet"
+  stats_path: "E:\\projects\\tornado-track\\stats.json"
+
+# ---------------------------------------------------------------------------
+# NOAA DAT ingestion
+# ---------------------------------------------------------------------------
+dat:
+  base_url: "https://services.dat.noaa.gov/arcgis/rest/services/nws_damageassessmenttoolkit/DamageViewer/FeatureServer"
+  years_back: 5                # Number of years of data to ingest
+  event_type: "Tornado"
+
+# ---------------------------------------------------------------------------
+# AWS MRMS download
+# ---------------------------------------------------------------------------
+mrms:
+  bucket: "noaa-mrms-pds"
+  region: "us-east-1"
+  anonymous: true              # Public bucket — no credentials needed
+  variables:
+    - "ReflectivityQC"
+    - "AzShear_0-2kmAGL"
+    - "AzShear_3-6kmAGL"
+    - "MESH"
+    - "RotationTrack30min"
+    - "RotationTrack60min"
+    - "RotationTrackML30min"
+    - "RotationTrackML60min"
+  time_window_minutes: 90      # ± minutes around event
+  spatial_buffer_km: 50        # Buffer around DAT track bbox
+
+# ---------------------------------------------------------------------------
+# GRIB → xarray conversion
+# ---------------------------------------------------------------------------
+grib:
+  normalize_lon: true          # Convert 0-360° → WGS84 -180 to 180°
+
+# ---------------------------------------------------------------------------
+# Zarr store
+# ---------------------------------------------------------------------------
+zarr:
+  grid_size: 200               # HxW crop in grid cells (~1 km each)
+  chunk_t: 10                  # Temporal chunk size
+  chunk_h: 64                  # Spatial chunk height (with overlap)
+  chunk_w: 64                  # Spatial chunk width (with overlap)
+  overlap: 8                   # Overlap cells to prevent edge effects
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+training:
+  episodes_per_stage: 5000
+  max_steps_per_episode: 90    # Timesteps per episode (matches 90-min window)
+  train_val_test_split: [0.70, 0.15, 0.15]  # By year — no temporal leakage
+
+  # PPO hyperparameters (CleanRL)
+  learning_rate: 3.0e-4
+  n_steps: 2048
+  batch_size: 64
+  n_epochs: 10
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_coef: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+
+  # Reward weights
+  reward:
+    w_polygon_iou: 1.0         # Spatial track overlap
+    w_rotation_anchor: 0.5     # Physics anchoring via RotationTrack
+    w_false_active: 2.0        # Stage 3 cost-of-effort penalty multiplier
+    w_lifecycle: 0.8           # Correct touchdown/lift timing
+
+  # Lifecycle thresholds
+  lifecycle:
+    touchdown_threshold: 0.7
+    lift_threshold: 0.3
+
+# ---------------------------------------------------------------------------
+# Model architecture
+# ---------------------------------------------------------------------------
+model:
+  cnn_channels: [32, 64, 128]  # Conv layer output channels
+  lstm_hidden: 256
+  actor_hidden: 128
+  lifecycle_hidden: 64
+  ef_classification: true      # Enable EF-level head (optional)
+  ef_classes: 6                # EF0–EF5
+
+# ---------------------------------------------------------------------------
+# Inference
+# ---------------------------------------------------------------------------
+inference:
+  confidence_sigma: [1.0, 2.0]   # Sigma levels for output polygons
+  output_format: "geojson"
