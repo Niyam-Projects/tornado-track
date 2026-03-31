@@ -94,6 +94,7 @@ class TornadoTrackEnv(gym.Env):
         self._dat_track: LineString | None = None
         self._dat_polygon = None
         self._active_steps: list[bool] = []
+        self._episode_step = 0
         self._t: int = 0
         self._max_t: int = 0
         self._agent_y: float = 0.0
@@ -112,10 +113,23 @@ class TornadoTrackEnv(gym.Env):
         row = self._index.sample(1, random_state=rng.integers(0, 2**31)).iloc[0]
         self._event = row.to_dict()
 
-        # Load Zarr data → numpy (C, T, H, W)
+        # Load Zarr data → numpy (C, T, H, W), channels ordered to match cfg.mrms.variables
         zarr_path = row["zarr_path"]
         ds = xr.open_zarr(zarr_path, consolidated=True)
-        data = ds.to_array(dim="channel").values  # (C, T, H, W)
+
+        # xr.to_array() sorts alphabetically — reorder to config variable order
+        zarr_vars = list(ds.data_vars)
+        missing = [v for v in cfg.mrms.variables if v not in zarr_vars]
+        if missing:
+            log.warning("Event %s missing variables: %s", row.get("event_id"), missing)
+        present = [v for v in cfg.mrms.variables if v in zarr_vars]
+        data = ds[present].to_array(dim="channel").sel(channel=present).values  # (C, T, H, W)
+
+        if len(present) < _N_CHANNELS:
+            # Pad missing channels with zeros so observation shape stays constant
+            pad = np.zeros((_N_CHANNELS - len(present), *data.shape[1:]), dtype=data.dtype)
+            data = np.concatenate([data, pad], axis=0)
+
         data = self._normalize(data)
         self._data = data.astype(np.float32)
         self._max_t = data.shape[1] - 1
@@ -133,6 +147,7 @@ class TornadoTrackEnv(gym.Env):
         self._agent_y, self._agent_x = self._spawn_position()
         self._agent_r = float(_INIT_RADIUS)
         self._t = self._spawn_timestep()
+        self._episode_step = 0
 
         obs = self._get_obs()
         return obs, {}
@@ -143,17 +158,11 @@ class TornadoTrackEnv(gym.Env):
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict]:
         dx, dy, dr = float(action[0]), float(action[1]), float(action[2])
 
-        # Apply action
-        self._agent_x = float(np.clip(self._agent_x + dx, 0, _GRID_SIZE - 1))
-        self._agent_y = float(np.clip(self._agent_y + dy, 0, _GRID_SIZE - 1))
-        self._agent_r = float(np.clip(self._agent_r + dr, _MIN_RADIUS, _MAX_RADIUS))
+        self._episode_step += 1
         self._t = min(self._t + 1, self._max_t)
 
         obs = self._get_obs()
 
-        # Lifecycle prediction from the lifecycle head (injected via info dict)
-        # During training the policy provides lifecycle_prob; we compute reward
-        # based on a threshold-converted boolean here.
         lifecycle_prob = float(getattr(self, "_last_lifecycle_prob", 0.5))
         pred_active = lifecycle_prob > _TOUCHDOWN_THRESHOLD
         dat_active = self._active_steps[self._t] if self._t < len(self._active_steps) else False
@@ -164,7 +173,7 @@ class TornadoTrackEnv(gym.Env):
             agent_x=int(self._agent_x),
             agent_radius=self._agent_r,
             pred_active=pred_active,
-            dat_polygon=self._dat_polygon,
+            dat_track=self._dat_track,
             dat_active=dat_active,
             grid_lat=self._grid_lat,
             grid_lon=self._grid_lon,
@@ -174,7 +183,9 @@ class TornadoTrackEnv(gym.Env):
         terminated = self._t >= self._max_t
         if self.stage == 3 and pred_active and not dat_active and self._t > 0:
             if self._active_steps and not any(self._active_steps[: self._t]):
-                terminated = True  # Early termination for persistent false active
+                terminated = True
+
+        truncated = self._episode_step >= cfg.training.max_steps_per_episode
 
         info = {
             "t": self._t,
@@ -184,7 +195,7 @@ class TornadoTrackEnv(gym.Env):
             "dat_active": dat_active,
             "pred_active": pred_active,
         }
-        return obs, reward, terminated, False, info
+        return obs, reward, terminated, truncated, info
 
     # ------------------------------------------------------------------
     # Helpers
@@ -199,10 +210,12 @@ class TornadoTrackEnv(gym.Env):
     def _normalize(self, data: np.ndarray) -> np.ndarray:
         """Z-score normalize each channel using pre-computed stats."""
         for i, var in enumerate(cfg.mrms.variables):
-            if var in self._stats:
-                mean = self._stats[var]["mean"]
-                std = max(self._stats[var]["std"], 1e-8)
-                data[i] = (data[i] - mean) / std
+            if var not in self._stats:
+                log.warning("No normalization stats for variable '%s' — channel %d left raw", var, i)
+                continue
+            mean = self._stats[var]["mean"]
+            std = max(self._stats[var]["std"], 1e-8)
+            data[i] = (data[i] - mean) / std
         return data
 
     def _spawn_position(self) -> tuple[float, float]:

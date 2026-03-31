@@ -2,19 +2,19 @@
 Reward function for the TornadoTrackEnv.
 
 Combines four components:
-  1. polygon_iou     — spatial overlap of predicted swath vs DAT polygon
-  2. rotation_anchor — mean RotationTrack value under the agent's position
-  3. false_active    — penalty for claiming tornado is active when DAT shows none (Stage 3)
-  4. lifecycle       — bonus for correct touchdown / lift detection timing
+  1. track_proximity  — Gaussian reward for being close to the DAT tornado track line
+  2. rotation_anchor  — mean RotationTrack value under the agent's position
+  3. false_active     — penalty for claiming tornado is active when DAT shows none (Stage 3)
+  4. lifecycle        — bonus for correct touchdown / lift detection timing
 """
 from __future__ import annotations
 
 import numpy as np
-from shapely.geometry import Point, Polygon
+from shapely.geometry import LineString, Point
 
 from config import cfg
 
-_W_IOU = cfg.training.reward.w_polygon_iou
+_W_TRACK = cfg.training.reward.w_track_proximity
 _W_ROT = cfg.training.reward.w_rotation_anchor
 _W_FALSE = cfg.training.reward.w_false_active
 _W_LIFE = cfg.training.reward.w_lifecycle
@@ -23,18 +23,36 @@ _W_LIFE = cfg.training.reward.w_lifecycle
 _ROTATION_TRACK_30MIN_IDX = 4   # RotationTrack30min
 _ROTATION_TRACK_60MIN_IDX = 5   # RotationTrack60min
 
+# Track proximity falloff: reward = 1.0 on the line, ~0.61 at sigma_km, ~0.14 at 2×sigma_km
+_TRACK_SIGMA_KM = 10.0
+_DEG_TO_KM = 111.0  # 1 degree latitude ≈ 111 km
 
-def polygon_iou(pred_polygon: Polygon, dat_polygon: Polygon | None) -> float:
-    """Intersection-over-Union between predicted swath and DAT damage polygon."""
-    if dat_polygon is None or pred_polygon is None:
+
+def track_proximity_reward(
+    agent_y: int,
+    agent_x: int,
+    dat_track: LineString | None,
+    grid_lat: np.ndarray,
+    grid_lon: np.ndarray,
+) -> float:
+    """
+    Gaussian reward for how close the agent is to the DAT tornado track line.
+
+    Returns 1.0 when the agent is exactly on the track, decaying to near-zero
+    beyond _TRACK_SIGMA_KM. Works for all events that have a DAT track.
+    """
+    if dat_track is None or len(grid_lat) == 0 or len(grid_lon) == 0:
         return 0.0
-    if not (pred_polygon.is_valid and dat_polygon.is_valid):
-        return 0.0
-    intersection = pred_polygon.intersection(dat_polygon).area
-    union = pred_polygon.union(dat_polygon).area
-    if union == 0:
-        return 0.0
-    return float(intersection / union)
+
+    iy = int(np.clip(agent_y, 0, len(grid_lat) - 1))
+    ix = int(np.clip(agent_x, 0, len(grid_lon) - 1))
+    agent_point = Point(float(grid_lon[ix]), float(grid_lat[iy]))
+
+    # Shapely distance in degrees (lon/lat space)
+    dist_deg = agent_point.distance(dat_track)
+    dist_km = dist_deg * _DEG_TO_KM
+
+    return float(np.exp(-0.5 * (dist_km / _TRACK_SIGMA_KM) ** 2))
 
 
 def rotation_anchor(
@@ -82,7 +100,7 @@ def compute_reward(
     agent_x: int,
     agent_radius: float,
     pred_active: bool,
-    dat_polygon: Polygon | None,
+    dat_track: LineString | None,
     dat_active: bool,
     grid_lat: np.ndarray,
     grid_lon: np.ndarray,
@@ -96,7 +114,7 @@ def compute_reward(
         agent_y/x:     Agent position in grid cells.
         agent_radius:  Predicted polygon radius in grid cells.
         pred_active:   Whether Lifecycle head predicts tornado on ground.
-        dat_polygon:   Ground-truth DAT damage polygon (Shapely) or None.
+        dat_track:     Ground-truth DAT tornado track LineString or None.
         dat_active:    Whether DAT shows tornado on ground at this timestep.
         grid_lat/lon:  1D arrays of lat/lon for each grid cell.
         stage:         Curriculum stage (1, 2, or 3).
@@ -104,19 +122,12 @@ def compute_reward(
     Returns:
         Scalar reward float.
     """
-    # Build predicted polygon (circle approximated as buffer in lon/lat space)
-    pred_poly = None
-    if 0 <= agent_y < len(grid_lat) and 0 <= agent_x < len(grid_lon):
-        center = Point(grid_lon[agent_x], grid_lat[agent_y])
-        radius_deg = agent_radius * abs(grid_lat[1] - grid_lat[0]) if len(grid_lat) > 1 else 0.01
-        pred_poly = center.buffer(radius_deg)
-
-    iou = polygon_iou(pred_poly, dat_polygon) if pred_poly else 0.0
+    proximity = track_proximity_reward(agent_y, agent_x, dat_track, grid_lat, grid_lon)
     rot = rotation_anchor(obs, agent_y, agent_x)
     life = lifecycle_reward(pred_active, dat_active, stage)
 
     reward = (
-        _W_IOU * iou
+        _W_TRACK * proximity
         + _W_ROT * rot
         + _W_LIFE * life
     )

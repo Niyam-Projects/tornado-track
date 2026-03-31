@@ -58,7 +58,7 @@ class ZarrConfig(BaseModel):
 
 
 class RewardConfig(BaseModel):
-    w_polygon_iou: float = 1.0
+    w_track_proximity: float = 1.0
     w_rotation_anchor: float = 0.5
     w_false_active: float = 2.0
     w_lifecycle: float = 0.8

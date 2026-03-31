@@ -25,6 +25,7 @@ dependencies = [
     "gymnasium>=0.29.0",
     "torch>=2.2.0",
     "torchvision>=0.17.0",
+    "torchaudio>=2.2.0",
     "tensorboard>=2.16.0",
     # Data / Numeric
     "numpy>=1.26.0",
@@ -58,6 +59,16 @@ predict        = "inference.predict:main"
 # CleanRL must be installed from source — add after `uv sync` with:
 #   uv pip install "cleanrl @ git+https://github.com/vwxyzjn/cleanrl.git"
 # eccodes (GRIB2 C library) is a system/conda dependency — see README.
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }
+torchaudio = { index = "pytorch-cu126" }
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
 
 [build-system]
 requires = ["hatchling"]

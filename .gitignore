@@ -1,0 +1,95 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+wheels/
+.installed.cfg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+
+# uv
+.uv/
+
+# Distribution / packaging
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Testing
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+.pytest_cache/
+htmlcov/
+*.cover
+*.coveragerc
+nosetests.xml
+coverage.xml
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pytype/
+.pyre/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# PyTorch checkpoints and model weights
+*.pt
+*.pth
+*.ckpt
+
+# TensorBoard logs
+reports/tensorboard/
+
+# Data — large files managed outside the repo
+*.parquet
+*.zarr/
+*.grib2
+*.grib2.gz
+*.nc
+*.hdf5
+*.h5
+stats.json
+splits.txt
+
+# Local data root (everything under E:\projects\tornado-track is external)
+data/mrms_cache/
+
+# Secrets / credentials
+.env
+.env.*
+*.pem
+*.key
+secrets.yaml
+
+# OS
+Desktop.ini

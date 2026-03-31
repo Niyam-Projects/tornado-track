@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
 from config import cfg
 from env.tornado_env import TornadoTrackEnv
@@ -85,6 +86,64 @@ def compute_gae(
 
 
 # ---------------------------------------------------------------------------
+# Training helpers
+# ---------------------------------------------------------------------------
+_MAX_TIMESTEPS_WARN = 500   # Flag events with unusually large timestep counts
+
+
+def _update_step_bar(bar: "tqdm", env: "TornadoTrackEnv") -> None:
+    """Update the step-level progress bar description with the current storm name."""
+    event_id = env._event.get("event_id", "?") if env._event else "?"
+    n_t = env._max_t + 1
+    warn = " ⚠ large" if n_t > _MAX_TIMESTEPS_WARN else ""
+    bar.set_description(f"  {event_id} ({n_t} steps){warn}")
+    bar.total = n_t
+    bar.refresh()
+
+
+def _log_splits(env: "TornadoTrackEnv", stage: int) -> None:
+    """Log and write the train/val/test event split report at training startup."""
+    import pandas as pd
+
+    idx = pd.read_parquet(cfg.data.index_path)
+
+    reports_dir = Path(cfg.data.reports_dir)
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    report_path = reports_dir / "splits.txt"
+
+    lines = []
+    lines.append(f"{'='*60}")
+    lines.append(f"Stage {stage} — Event Split Report")
+    lines.append(f"{'='*60}")
+
+    for split in ("train", "val", "test"):
+        subset = idx[idx["split"] == split].sort_values("event_id")
+        total_steps = subset["n_timesteps"].sum() if "n_timesteps" in subset.columns else 0
+        lines.append(f"\n{split.upper()} ({len(subset)} events, {total_steps:,} total timesteps)")
+        lines.append(f"  {'Event':<40} {'Timesteps':>10}  {'Start':>26}")
+        lines.append(f"  {'-'*40} {'-'*10}  {'-'*26}")
+        for _, row in subset.iterrows():
+            n_t = row.get("n_timesteps", "?")
+            start = str(row.get("start_time", ""))[:19]
+            flag = " ⚠" if isinstance(n_t, (int, float)) and n_t > _MAX_TIMESTEPS_WARN else ""
+            lines.append(f"  {row['event_id']:<40} {str(n_t):>10}{flag}  {start:>26}")
+
+    lines.append(f"\n{'='*60}")
+    outliers = idx[idx["n_timesteps"] > _MAX_TIMESTEPS_WARN] if "n_timesteps" in idx.columns else idx.iloc[0:0]
+    if not outliers.empty:
+        lines.append(f"⚠  {len(outliers)} event(s) exceed {_MAX_TIMESTEPS_WARN} timesteps — may slow training:")
+        for _, row in outliers.iterrows():
+            lines.append(f"   • {row['event_id']} ({row['n_timesteps']} steps) in {row['split']}")
+    lines.append(f"{'='*60}\n")
+
+    report = "\n".join(lines)
+    log.info("\n%s", report)
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(report)
+    log.info("Split report written → %s", report_path)
+
+
+# ---------------------------------------------------------------------------
 # Main training function
 # ---------------------------------------------------------------------------
 def train_ppo(
@@ -120,6 +179,8 @@ def train_ppo(
     obs_shape = env.observation_space.shape
     action_dim = env.action_space.shape[0]
 
+    _log_splits(env, stage)
+
     policy = TornadoPolicy().to(_DEVICE)
     if checkpoint_in and checkpoint_in.exists():
         log.info("Loading checkpoint: %s", checkpoint_in)
@@ -137,6 +198,11 @@ def train_ppo(
     obs = torch.from_numpy(obs_np).float().to(_DEVICE)
     lstm_h = lstm_c = None
     ep_reward = 0.0
+    ep_step = 0
+
+    ep_bar = tqdm(total=total_episodes, desc=f"Stage {stage} episodes", unit="ep", dynamic_ncols=True)
+    step_bar = tqdm(total=tc.max_steps_per_episode, desc="  Episode steps", unit="step", dynamic_ncols=True, leave=False)
+    _update_step_bar(step_bar, env)
 
     while episode_count < total_episodes:
         with torch.no_grad():
@@ -159,6 +225,8 @@ def train_ppo(
         done = terminated or truncated
         ep_reward += reward
         global_step += 1
+        ep_step += 1
+        step_bar.update(1)
 
         buf.add(
             obs=obs,
@@ -173,11 +241,16 @@ def train_ppo(
             episode_count += 1
             episode_rewards.append(ep_reward)
             writer.add_scalar("train/episode_reward", ep_reward, episode_count)
-            if episode_count % 50 == 0:
-                mean_r = np.mean(episode_rewards[-50:])
+            writer.flush()
+
+            mean_r = float(np.mean(episode_rewards[-50:]))
+            ep_bar.set_postfix(reward=f"{ep_reward:.3f}", mean50=f"{mean_r:.3f}", step=global_step)
+            ep_bar.update(1)
+
+            if episode_count % 10 == 0:
                 log.info(
-                    "Stage %d | ep=%d/%d | mean_reward(50)=%.3f",
-                    stage, episode_count, total_episodes, mean_r,
+                    "Stage %d | ep=%d/%d | reward=%.3f | mean_reward(50)=%.3f",
+                    stage, episode_count, total_episodes, ep_reward, mean_r,
                 )
                 writer.add_scalar("train/mean_reward_50", mean_r, episode_count)
 
@@ -185,6 +258,9 @@ def train_ppo(
             obs = torch.from_numpy(obs_np).float().to(_DEVICE)
             lstm_h = lstm_c = None
             ep_reward = 0.0
+            ep_step = 0
+            step_bar.reset()
+            _update_step_bar(step_bar, env)
         else:
             obs = torch.from_numpy(next_obs_np).float().to(_DEVICE)
 
@@ -239,6 +315,9 @@ def train_ppo(
             writer.add_scalar("train/value_loss", v_loss.item(), global_step)
             writer.add_scalar("train/entropy", ent_loss.item(), global_step)
             buf.reset()
+
+    ep_bar.close()
+    step_bar.close()
 
     # Save final checkpoint
     ckpt_path = ckpt_dir / "checkpoint_final.pt"
