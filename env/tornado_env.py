@@ -1,4 +1,4 @@
-"""
+﻿"""
 TornadoTrackEnv — Gymnasium environment for tornado path tracking RL.
 
 Observation space: (C, H, W) float32 tensor — one timestep of the 8-channel
@@ -140,8 +140,12 @@ class TornadoTrackEnv(gym.Env):
         self._grid_lon = ds.coords.get("x", ds.coords.get("longitude", None))
         self._grid_lon = np.array(self._grid_lon) if self._grid_lon is not None else np.linspace(0, 1, _GRID_SIZE)
 
+        # Extract zarr time coordinate for active-flag computation
+        _zt = ds.coords.get("time", ds.coords.get("t", None))
+        zarr_times = pd.DatetimeIndex(_zt.values) if _zt is not None else None
+
         # Load DAT track and derive active timestep flags
-        self._dat_track, self._dat_polygon, self._active_steps = self._load_dat_info(row)
+        self._dat_track, self._dat_polygon, self._active_steps = self._load_dat_info(row, zarr_times)
 
         # Spawn agent according to stage
         self._agent_y, self._agent_x = self._spawn_position()
@@ -208,14 +212,24 @@ class TornadoTrackEnv(gym.Env):
         return obs.astype(np.float32)
 
     def _normalize(self, data: np.ndarray) -> np.ndarray:
-        """Z-score normalize each channel using pre-computed stats."""
+        """Normalize each channel.
+
+        Rotation channels use a clipped linear scaler so that the 0.01 s^-1
+        threshold maps cleanly to 1.0 for the CNN -- preventing the strong core
+        signal from being washed out by a high background standard deviation.
+
+        All other channels use Z-score normalization via pre-computed stats.
+        """
         for i, var in enumerate(cfg.mrms.variables):
-            if var not in self._stats:
+            if "RotationTrack" in var:
+                # Clipped linear: 0.01 s^-1 -> 1.0 (max brightness)
+                data[i] = np.clip(data[i] / 0.01, 0.0, 1.0)
+            elif var in self._stats:
+                mean = self._stats[var]["mean"]
+                std = max(self._stats[var]["std"], 1e-8)
+                data[i] = (data[i] - mean) / std
+            else:
                 log.warning("No normalization stats for variable '%s' — channel %d left raw", var, i)
-                continue
-            mean = self._stats[var]["mean"]
-            std = max(self._stats[var]["std"], 1e-8)
-            data[i] = (data[i] - mean) / std
         return data
 
     def _spawn_position(self) -> tuple[float, float]:
@@ -256,15 +270,17 @@ class TornadoTrackEnv(gym.Env):
         return y, x
 
     def _load_dat_info(
-        self, row: pd.Series
+        self, row: pd.Series, zarr_times: pd.DatetimeIndex | None
     ) -> tuple[LineString | None, Any, list[bool]]:
-        """Load DAT track and build per-timestep active flags."""
+        """Load DAT track and build per-timestep active flags from real DAT timestamps."""
         dat_dir = Path(cfg.data.dat_dir)
         track_path = dat_dir / "dat_tracks.parquet"
         ef_path = dat_dir / "dat_ef_polygons.parquet"
 
         track_geom = None
         ef_polygon = None
+        dat_start: pd.Timestamp | None = None
+        dat_end: pd.Timestamp | None = None
 
         event_id = row.get("event_id")
         try:
@@ -272,6 +288,10 @@ class TornadoTrackEnv(gym.Env):
             match = tracks_gdf[tracks_gdf["event_id"] == event_id]
             if not match.empty:
                 track_geom = match.iloc[0].geometry
+                def _to_naive(ts: pd.Timestamp) -> pd.Timestamp:
+                    return ts.tz_convert(None) if ts.tzinfo is not None else ts
+                dat_start = _to_naive(pd.Timestamp(match.iloc[0]["start_time"]))
+                dat_end = _to_naive(pd.Timestamp(match.iloc[0]["end_time"]))
 
             ef_gdf = gpd.read_parquet(ef_path)
             ef_match = ef_gdf[ef_gdf["event_id"] == event_id]
@@ -280,15 +300,18 @@ class TornadoTrackEnv(gym.Env):
         except Exception as exc:
             log.warning("Could not load DAT info for event %s: %s", event_id, exc)
 
-        # Build active flags: True for timesteps within the tornado window
+        # Build active flags from real DAT start/end times mapped to zarr timesteps
         n_steps = self._max_t + 1
         active = [False] * n_steps
-        if self._data is not None:
-            # Approximate: middle third of timesteps = active
-            t_start = n_steps // 3
-            t_end = 2 * n_steps // 3
-            for i in range(t_start, t_end):
-                active[i] = True
+        if zarr_times is not None and dat_start is not None and dat_end is not None:
+            # Ensure timezone-naive comparison
+            tz_times = zarr_times.tz_localize(None) if zarr_times.tz is not None else zarr_times
+            for i, t in enumerate(tz_times):
+                if i >= n_steps:
+                    break
+                active[i] = bool(dat_start <= t <= dat_end)
+        elif dat_start is not None:
+            log.warning("zarr time coordinate unavailable for event %s — active flags unset", event_id)
 
         return track_geom, ef_polygon, active
 

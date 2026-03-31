@@ -3,7 +3,7 @@ Reward function for the TornadoTrackEnv.
 
 Combines four components:
   1. track_proximity  — Gaussian reward for being close to the DAT tornado track line
-  2. rotation_anchor  — mean RotationTrack value under the agent's position
+  2. rotation_anchor  — peak RotationTrack value under the agent's position
   3. false_active     — penalty for claiming tornado is active when DAT shows none (Stage 3)
   4. lifecycle        — bonus for correct touchdown / lift detection timing
 """
@@ -20,8 +20,12 @@ _W_FALSE = cfg.training.reward.w_false_active
 _W_LIFE = cfg.training.reward.w_lifecycle
 
 # Channel indices (matches config variable order)
-_ROTATION_TRACK_30MIN_IDX = 4   # RotationTrack30min
-_ROTATION_TRACK_60MIN_IDX = 5   # RotationTrack60min
+_ROT_LL_60_IDX = 5   # RotationTrack60min     (low-level,  0–2 km)
+_ROT_ML_60_IDX = 7   # RotationTrackML60min   (mid-level,  3–6 km)
+
+# Rotation scoring constants
+_ROT_THRESHOLD = 1.0  # normalized units — equals 0.01 s⁻¹ after clipped-linear scaling
+_ROT_RADIUS = 3       # grid-cell radius of the peak-search window (~3 km)
 
 # Track proximity falloff: reward = 1.0 on the line, ~0.61 at sigma_km, ~0.14 at 2×sigma_km
 _TRACK_SIGMA_KM = 10.0
@@ -59,23 +63,40 @@ def rotation_anchor(
     obs: np.ndarray,
     agent_y: int,
     agent_x: int,
-    radius_cells: int = 5,
+    stage: int,
+    radius_cells: int = _ROT_RADIUS,
 ) -> float:
     """
-    Mean of RotationTrack30min + RotationTrack60min in a small window around
-    the agent's grid position. Normalizes to [0, 1] assuming max meaningful
-    rotation ~0.01 s⁻¹ (MRMS azimuthal shear scale).
-    """
-    max_rotation = 0.01
-    h, w = obs.shape[-2], obs.shape[-1]
-    y0, y1 = max(0, agent_y - radius_cells), min(h, agent_y + radius_cells + 1)
-    x0, x1 = max(0, agent_x - radius_cells), min(w, agent_x + radius_cells + 1)
+    Peak-based rotation reward using RotationTrack60min (LL) and RotationTrackML60min (ML).
 
-    rot30 = obs[_ROTATION_TRACK_30MIN_IDX, y0:y1, x0:x1]
-    rot60 = obs[_ROTATION_TRACK_60MIN_IDX, y0:y1, x0:x1]
-    combined = (rot30 + rot60) / 2.0
-    mean_val = float(np.nanmean(combined)) if combined.size > 0 else 0.0
-    return float(np.clip(mean_val / max_rotation, 0.0, 1.0))
+    Uses np.nanmax over a tight radius window so the tornado's core signal is not
+    washed out by surrounding low-rotation rain bands. Values are in normalized space
+    where _ROT_THRESHOLD (1.0) corresponds to 0.01 s⁻¹.
+
+    Stage 2 (Hunter) weights mid-level rotation higher to guide the agent toward
+    pre-tornadic mesocyclone signatures before surface touchdown.
+    """
+    h, w = obs.shape[-2], obs.shape[-1]
+    y0 = max(0, agent_y - radius_cells)
+    y1 = min(h, agent_y + radius_cells + 1)
+    x0 = max(0, agent_x - radius_cells)
+    x1 = min(w, agent_x + radius_cells + 1)
+
+    if y1 <= y0 or x1 <= x0:
+        return 0.0
+
+    ll_peak = float(np.nanmax(obs[_ROT_LL_60_IDX, y0:y1, x0:x1]))
+    ml_peak = float(np.nanmax(obs[_ROT_ML_60_IDX, y0:y1, x0:x1]))
+
+    ll_score = float(np.clip(ll_peak / _ROT_THRESHOLD, 0.0, 1.5))
+    ml_score = float(np.clip(ml_peak / _ROT_THRESHOLD, 0.0, 1.5))
+
+    # Stage 2: weight mid-level higher — the agent must "look up" for the
+    # 3–6 km rotation that precedes surface tornado touchdown.
+    w_ml = 0.7 if stage == 2 else 0.5
+    w_ll = 0.3 if stage == 2 else 0.5
+
+    return float(w_ll * ll_score + w_ml * ml_score)
 
 
 def lifecycle_reward(
@@ -123,7 +144,7 @@ def compute_reward(
         Scalar reward float.
     """
     proximity = track_proximity_reward(agent_y, agent_x, dat_track, grid_lat, grid_lon)
-    rot = rotation_anchor(obs, agent_y, agent_x)
+    rot = rotation_anchor(obs, agent_y, agent_x, stage)
     life = lifecycle_reward(pred_active, dat_active, stage)
 
     reward = (
