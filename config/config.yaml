@@ -107,6 +107,8 @@ model:
 curriculum:
   monster_threshold: 0.015   # max_rotation_score (s⁻¹) → Tier 1 "Monster"
   weak_threshold: 0.005      # max_rotation_score (s⁻¹) → Tier 3 "Weak"
+  min_monster_steps: 95      # minimum n_timesteps required for Tier 1 "Monster"
+  min_monster_length_mi: 5.0 # minimum DAT track length (miles) required for Tier 1 "Monster"
   stage1_tier: 1             # Stage 1 trains ONLY on Tier 1 (Monster) events
   stage2_tier: 2             # Stage 2 introduces Tier 1+2 events
   stage3_tier: 3             # Stage 3 uses all tiers

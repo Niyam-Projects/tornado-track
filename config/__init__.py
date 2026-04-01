@@ -102,11 +102,13 @@ class InferenceConfig(BaseModel):
 
 
 class CurriculumConfig(BaseModel):
-    monster_threshold: float = 0.015  # max_rotation_score s⁻¹ → Tier 1
-    weak_threshold: float = 0.005     # max_rotation_score s⁻¹ → Tier 3
-    stage1_tier: int = 1              # Stage 1 uses only Tier 1 events
-    stage2_tier: int = 2              # Stage 2 uses Tier 1+2 events
-    stage3_tier: int = 3              # Stage 3 uses all tiers
+    monster_threshold: float = 0.015      # max_rotation_score s⁻¹ → Tier 1
+    weak_threshold: float = 0.005         # max_rotation_score s⁻¹ → Tier 3
+    min_monster_steps: int = 95           # min n_timesteps for Tier 1 "Monster"
+    min_monster_length_mi: float = 5.0    # min DAT track length (miles) for Tier 1 "Monster"
+    stage1_tier: int = 1                  # Stage 1 uses only Tier 1 events
+    stage2_tier: int = 2                  # Stage 2 uses Tier 1+2 events
+    stage3_tier: int = 3                  # Stage 3 uses all tiers
 
 
 class NormalizationConfig(BaseModel):

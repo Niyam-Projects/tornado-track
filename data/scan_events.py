@@ -11,8 +11,11 @@ For each completed zarr event (detected via metadata.json sidecars) it:
   4. Computes a Signal-to-Noise Ratio (SNR) score for each event based on the
      peak RotationTrack60min value and classifies it into curriculum tiers:
 
-       Tier 1 "Monster"  : max_rotation_score > monster_threshold (e.g. Kankakee)
+       Tier 1 "Monster"  : max_rotation_score > monster_threshold
+                           AND n_timesteps >= min_monster_steps
+                           AND length_mi >= min_monster_length_mi
        Tier 2 "Moderate" : weak_threshold < max_rotation_score <= monster_threshold
+                           (or Monster rotation but fails steps/length criteria)
        Tier 3 "Weak"     : max_rotation_score <= weak_threshold
 
   5. Writes the result as a GeoParquet file (EPSG:4326) so downstream tools
@@ -72,7 +75,8 @@ _CRS = "EPSG:4326"
 def _assign_split(year: int, years: list[int]) -> str:
     sorted_years = sorted(set(years))
     n = len(sorted_years)
-    train_end = int(n * cfg.training.train_val_test_split[0])
+    # Use max(1, ...) so at least one year lands in train even with a tiny dataset
+    train_end = max(1, int(n * cfg.training.train_val_test_split[0]))
     val_end = train_end + int(n * cfg.training.train_val_test_split[1])
     idx = sorted_years.index(year) if year in sorted_years else 0
     if idx < train_end:
@@ -182,9 +186,21 @@ def _build_event_rows(
 # Per-event metric computation
 # ---------------------------------------------------------------------------
 
-def _scan_event(zarr_path: Path, monster_threshold: float, weak_threshold: float) -> dict:
+def _scan_event(
+    zarr_path: Path,
+    monster_threshold: float,
+    weak_threshold: float,
+    min_monster_steps: int,
+    min_monster_length_mi: float,
+    length_mi: Optional[float],
+) -> dict:
     """
     Open one zarr store and compute quality metrics from RotationTrack60min.
+
+    Monster (Tier 1) requires all three conditions:
+      - max_rotation_score > monster_threshold
+      - n_timesteps >= min_monster_steps
+      - length_mi >= min_monster_length_mi (from DAT tracks, passed in)
 
     Returns a dict with all _SCORE_COLS values plus basic sanity flags.
     """
@@ -241,8 +257,17 @@ def _scan_event(zarr_path: Path, monster_threshold: float, weak_threshold: float
             else:
                 result["mean_rotation_core"] = 0.0
 
-            # Tier classification
-            if max_score > monster_threshold:
+            # Tier classification — all three conditions required for Monster
+            length_ok = (
+                length_mi is not None
+                and not (isinstance(length_mi, float) and np.isnan(length_mi))
+                and length_mi >= min_monster_length_mi
+            )
+            if (
+                max_score > monster_threshold
+                and result["n_timesteps"] >= min_monster_steps
+                and length_ok
+            ):
                 result["rotation_tier"] = "monster"
                 result["curriculum_stage"] = 1
             elif max_score > weak_threshold:
@@ -292,8 +317,8 @@ def _print_report(df: pd.DataFrame) -> None:
     if unscored_n:
         print(f"  Scan errors / skipped                              : {unscored_n}")
 
-    print(f"\n  {'Rank':<5} {'Event ID':<42} {'Tier':<10} {'MaxRot':>8} {'MeanCore':>10} {'Steps':>7} {'Split':<6} {'Flags'}")
-    print(f"  {'-'*5} {'-'*42} {'-'*10} {'-'*8} {'-'*10} {'-'*7} {'-'*6} {'-'*10}")
+    print(f"\n  {'Rank':<5} {'Event ID':<42} {'Tier':<10} {'MaxRot':>8} {'MeanCore':>10} {'Steps':>7} {'LenMi':>7} {'Split':<6} {'Flags'}")
+    print(f"  {'-'*5} {'-'*42} {'-'*10} {'-'*8} {'-'*10} {'-'*7} {'-'*7} {'-'*6} {'-'*10}")
 
     for rank, (_, row) in enumerate(scored.iterrows(), 1):
         tier = row.get("rotation_tier", "?")
@@ -304,11 +329,15 @@ def _print_report(df: pd.DataFrame) -> None:
         if row.get("data_completeness", 1.0) < 1.0:
             flags.append(f"⚠ {row['data_completeness']:.0%} vars")
 
+        lmi = row.get("length_mi")
+        lmi_str = f"{lmi:.1f}" if lmi is not None and not (isinstance(lmi, float) and np.isnan(lmi)) else "N/A"
+
         print(
             f"  {rank:<5} {str(row.get('event_id', '?')):<42} "
             f"{tier_icon} {tier:<8} {_fmt(row.get('max_rotation_score', float('nan'))):>8} "
             f"{_fmt(row.get('mean_rotation_core', float('nan'))):>10} "
             f"{int(row.get('n_timesteps', 0)):>7} "
+            f"{lmi_str:>7} "
             f"{str(row.get('split', '?')):<6} "
             f"{'  '.join(flags)}"
         )
@@ -356,6 +385,18 @@ def _fmt(v: float) -> str:
     help="max_rotation_score (s⁻¹) below which an event is 'Weak' (default from config).",
 )
 @click.option(
+    "--min-monster-steps",
+    default=None,
+    type=int,
+    help="Minimum n_timesteps required for Tier 1 'Monster' (default from config).",
+)
+@click.option(
+    "--min-monster-length-mi",
+    default=None,
+    type=float,
+    help="Minimum DAT track length in miles required for Tier 1 'Monster' (default from config).",
+)
+@click.option(
     "--report-only",
     is_flag=True,
     default=False,
@@ -372,6 +413,8 @@ def main(
     index_path: Optional[str],
     monster_threshold: Optional[float],
     weak_threshold: Optional[float],
+    min_monster_steps: Optional[int],
+    min_monster_length_mi: Optional[float],
     report_only: bool,
     force: bool,
 ) -> None:
@@ -383,9 +426,15 @@ def main(
     dat_tracks_path = Path(cfg.data.dat_dir) / "dat_tracks.parquet"
     monster_thr = monster_threshold if monster_threshold is not None else cfg.curriculum.monster_threshold
     weak_thr = weak_threshold if weak_threshold is not None else cfg.curriculum.weak_threshold
+    min_monster_steps_val = min_monster_steps if min_monster_steps is not None else cfg.curriculum.min_monster_steps
+    min_monster_length_mi_val = min_monster_length_mi if min_monster_length_mi is not None else cfg.curriculum.min_monster_length_mi
 
     log.info("Scanning events in: %s", events_root)
-    log.info("Monster threshold : %.4f s⁻¹  |  Weak threshold: %.4f s⁻¹", monster_thr, weak_thr)
+    log.info(
+        "Monster threshold : %.4f s⁻¹  |  Weak threshold: %.4f s⁻¹  |  "
+        "Min monster steps: %d  |  Min monster length: %.1f mi",
+        monster_thr, weak_thr, min_monster_steps_val, min_monster_length_mi_val,
+    )
 
     # Build base GeoDataFrame from metadata.json sidecars + DAT tracks join
     base_gdf = _build_event_rows(events_root, dat_tracks_path)
@@ -419,9 +468,13 @@ def main(
     ]
     log.info("Events to scan: %d  |  Already scored: %d", len(to_scan), len(existing_scores))
 
-    # Build event_id → zarr_path lookup from base_gdf
+    # Build event_id → zarr_path and event_id → length_mi lookups from base_gdf
     event_to_zarr: dict[str, Path] = {
         str(r["event_id"]): Path(r["zarr_path"])
+        for _, r in base_gdf.iterrows()
+    }
+    event_to_length_mi: dict[str, Optional[float]] = {
+        str(r["event_id"]): r.get("length_mi")
         for _, r in base_gdf.iterrows()
     }
 
@@ -431,7 +484,14 @@ def main(
     with tqdm(to_scan, desc="Scanning", unit="event") as bar:
         for event_id in bar:
             bar.set_postfix(event=event_id[:30])
-            result = _scan_event(event_to_zarr[event_id], monster_thr, weak_thr)
+            result = _scan_event(
+                event_to_zarr[event_id],
+                monster_thr,
+                weak_thr,
+                min_monster_steps_val,
+                min_monster_length_mi_val,
+                event_to_length_mi.get(event_id),
+            )
             scan_results[event_id] = result
             if result["scan_error"]:
                 errors += 1
@@ -457,18 +517,26 @@ def main(
 
     index = index.reset_index()
 
-    # Re-classify tiers if --force (thresholds may have changed)
-    if force and "max_rotation_score" in index.columns:
-        def _tier(score: float) -> tuple[str, int]:
+    # Always re-classify tiers so cached events pick up threshold/criteria changes
+    if "max_rotation_score" in index.columns:
+        def _tier(row: pd.Series) -> tuple[str, int]:
+            score = row.get("max_rotation_score")
             if pd.isna(score):
                 return ("unknown", 3)
-            if score > monster_thr:
+            steps = int(row.get("n_timesteps", 0) or 0)
+            lmi = row.get("length_mi")
+            length_ok = (
+                lmi is not None
+                and not (isinstance(lmi, float) and np.isnan(lmi))
+                and lmi >= min_monster_length_mi_val
+            )
+            if score > monster_thr and steps >= min_monster_steps_val and length_ok:
                 return ("monster", 1)
             if score > weak_thr:
                 return ("moderate", 2)
             return ("weak", 3)
 
-        tiers = index["max_rotation_score"].apply(_tier)
+        tiers = index.apply(_tier, axis=1)
         index["rotation_tier"] = tiers.apply(lambda t: t[0])
         index["curriculum_stage"] = tiers.apply(lambda t: t[1])
 
