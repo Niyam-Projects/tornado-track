@@ -19,11 +19,16 @@ log = logging.getLogger(__name__)
 
 @click.command()
 @click.option("--episodes", default=None, type=int, help="Override episode count")
-def main(episodes: int | None) -> None:
+@click.option(
+    "--tier", default=None, type=int,
+    help="Max curriculum tier to train on (1=Monster only, 2=Moderate+, 3=all). "
+         "Default: 1 (Stage 1 trains only on high-signal 'Monster' events).",
+)
+def main(episodes: int | None, tier: int | None) -> None:
     """Run Stage 1 (Follower) PPO training."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     log.info("=== Stage 1: Follower Training ===")
-    ckpt = train_ppo(stage=1, total_episodes=episodes, run_name="stage1_follower")
+    ckpt = train_ppo(stage=1, total_episodes=episodes, run_name="stage1_follower", min_tier=tier)
     log.info("Stage 1 complete. Checkpoint: %s", ckpt)
 
 

@@ -151,6 +151,7 @@ def train_ppo(
     checkpoint_in: Path | None = None,
     total_episodes: int | None = None,
     run_name: str | None = None,
+    min_tier: int | None = None,
 ) -> Path:
     """
     Run PPO training for a given curriculum stage.
@@ -160,6 +161,8 @@ def train_ppo(
         checkpoint_in:  Path to a prior-stage checkpoint to initialize from.
         total_episodes: Override number of episodes (default from config).
         run_name:       TensorBoard run name.
+        min_tier:       Max curriculum tier to include (1=Monster only, 2=Monster+Moderate,
+                        3=all). Defaults to cfg.curriculum.stage{N}_tier.
 
     Returns:
         Path to the final saved checkpoint.
@@ -168,14 +171,18 @@ def train_ppo(
     total_episodes = total_episodes or tc.episodes_per_stage
     run_name = run_name or f"stage{stage}_{int(time.time())}"
 
+    # Default tier per stage from config
+    if min_tier is None:
+        min_tier = getattr(cfg.curriculum, f"stage{stage}_tier", None)
+
     ckpt_dir = Path(cfg.data.checkpoints_dir) / f"stage{stage}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     log_dir = Path(cfg.data.reports_dir) / "tensorboard" / run_name
     writer = SummaryWriter(str(log_dir))
 
-    log.info("Stage %d training | device=%s | episodes=%d", stage, _DEVICE, total_episodes)
+    log.info("Stage %d training | device=%s | episodes=%d | min_tier=%s", stage, _DEVICE, total_episodes, min_tier)
 
-    env = TornadoTrackEnv(stage=stage, split="train")
+    env = TornadoTrackEnv(stage=stage, split="train", min_tier=min_tier)
     obs_shape = env.observation_space.shape
     action_dim = env.action_space.shape[0]
 

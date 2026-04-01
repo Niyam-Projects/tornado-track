@@ -6,11 +6,14 @@ For each tornado event:
   2. Streams .grib2.gz from S3, decompresses in memory
   3. Decodes with eccodes (35× faster than cfgrib), clips to event bbox
   4. Normalizes lon to WGS84 –180/180, regrids to common grid
-  5. Writes per-event Zarr store
+  5. Writes per-event Zarr store + metadata.json sidecar
 
 Output Zarr is directly readable by xarray for training:
   ds = xr.open_zarr("events/{event_id}/data.zarr")
   data = ds.to_array(dim="channel").values  # (C, T, H, W)
+
+index.parquet is NOT written here — run `uv run scan-events` after zarr-build
+to build/update the GeoParquet index.
 
 Usage:
     uv run zarr-build                       # 100 most recent unprocessed events
@@ -51,6 +54,16 @@ _GRID_SIZE = cfg.zarr.grid_size
 _CHUNK_T = cfg.zarr.chunk_t
 _CHUNK_H = cfg.zarr.chunk_h
 _CHUNK_W = cfg.zarr.chunk_w
+
+# MRMS application-level "no-data" sentinels.
+# These are distinct from the GRIB packing missingValue and are NOT automatically
+# masked by eccodes. Values at or below these thresholds carry no physical signal.
+#   ReflectivityAtLowestAltitude: -999.0  = outside radar coverage
+#   MESH:                           -1.0  = no hail detected (grid point outside hail swath)
+_MRMS_NODATA: dict[str, float] = {
+    "ReflectivityAtLowestAltitude": -999.0,
+    "MESH":                           -1.0,
+}
 
 # In-memory cache: s3fs listings per (product, date_str) — avoids re-listing
 _listing_cache: dict[str, list[str]] = {}
@@ -144,15 +157,24 @@ def _decode_grib(
         data = vals.reshape(Nj, Ni).astype(np.float32)
         data[data == miss] = np.nan
 
-        # Clip to bbox (convert WGS84 -180/180 → 0-360 for MRMS grid indexing)
+        # Mask MRMS application-level no-data sentinels (not covered by the
+        # GRIB missingValue above — e.g. -999 in ReflectivityAtLowestAltitude, -1 in MESH).
+        mrms_fill = _MRMS_NODATA.get(var_name)
+        if mrms_fill is not None:
+            data[data <= mrms_fill + 0.5] = np.nan
+
+        # Clip to bbox (convert WGS84 -180/180 → 0-360 for MRMS grid indexing).
+        # Use floor() for start and ceil() for end so the clipped window is always
+        # inclusive — round() on both ends can silently shrink the window by 1-2
+        # cells at each edge, undermining the spatial_buffer_km guarantee.
         minx, miny, maxx, maxy = bbox
         minx_360 = minx % 360
         maxx_360 = maxx % 360
 
-        j_start = max(0, int(round((lat1 - maxy) / dlat)))
-        j_end = min(Nj - 1, int(round((lat1 - miny) / dlat)))
-        i_start = max(0, int(round((minx_360 - lon1) / dlon)))
-        i_end = min(Ni - 1, int(round((maxx_360 - lon1) / dlon)))
+        j_start = max(0, int(np.floor((lat1 - maxy) / dlat)))
+        j_end = min(Nj - 1, int(np.ceil((lat1 - miny) / dlat)))
+        i_start = max(0, int(np.floor((minx_360 - lon1) / dlon)))
+        i_end = min(Ni - 1, int(np.ceil((maxx_360 - lon1) / dlon)))
 
         subset = data[j_start : j_end + 1, i_start : i_end + 1].copy()
 
@@ -232,6 +254,36 @@ def _regrid(das: list[xr.DataArray], grid_size: int) -> list[xr.DataArray]:
 
 
 # ---------------------------------------------------------------------------
+# Snap timestamps to nearest 2-minute boundary (MRMS cadence)
+# ---------------------------------------------------------------------------
+
+_SNAP_FREQ = "2min"
+
+
+def _snap_times(channel_arrays: list[xr.DataArray]) -> list[xr.DataArray]:
+    """Round each DataArray's time coordinate to the nearest 2-minute boundary.
+
+    MRMS products are all generated on a 2-minute cadence but arrive with
+    different processing delays (0–40 s). Snapping groups co-temporal
+    observations so that the union time axis has one slot per 2-minute window
+    instead of one slot per (product × window).
+
+    If two raw timestamps within the same variable snap to the same slot
+    (rare edge case at cadence boundaries), the first observation is kept.
+    """
+    snapped: list[xr.DataArray] = []
+    for da in channel_arrays:
+        new_times = pd.DatetimeIndex(da.time.values).round(_SNAP_FREQ)
+        da = da.assign_coords(time=new_times)
+        # Drop duplicates within this variable (keep first if two snap together)
+        _, unique_idx = np.unique(da.time.values, return_index=True)
+        if len(unique_idx) < len(da.time):
+            da = da.isel(time=sorted(unique_idx))
+        snapped.append(da)
+    return snapped
+
+
+# ---------------------------------------------------------------------------
 # Process one event → Zarr
 # ---------------------------------------------------------------------------
 
@@ -302,10 +354,24 @@ def _process_event(
     # Regrid to common grid_size × grid_size
     channel_arrays = _regrid(channel_arrays, _GRID_SIZE)
 
-    # Align time dimension (union of all timestamps, NaN-fill gaps)
-    all_times = sorted(set(t for da in channel_arrays for t in da.time.values))
+    # Snap timestamps to nearest 2-minute boundary.
+    # Each MRMS product has a different processing latency (RotationTrack at
+    # :00, AzShear at ~:20, ReflectivityAtLowestAltitude at ~:40), so raw timestamps never
+    # overlap across products. Rounding to the 2-minute MRMS cadence groups
+    # co-temporal observations into shared time slots. Without this, the union
+    # time axis has N × num_products entries with each variable NaN at every
+    # other variable's timestamps.
+    channel_arrays = _snap_times(channel_arrays)
+
+    # Build union time axis and align all variables to it.
+    master_times = sorted(set(t for da in channel_arrays for t in da.time.values))
+    log.debug(
+        "Union time axis: %d timesteps across %d variables for event %s",
+        len(master_times), len(channel_arrays), event_id,
+    )
+
     aligned = [
-        da.reindex(time=all_times, method=None, fill_value=np.nan)
+        da.reindex(time=master_times, method=None, fill_value=np.nan)
         for da in channel_arrays
     ]
 
@@ -321,7 +387,7 @@ def _process_event(
         "start_time": str(dt_start),
         "end_time": str(dt_end),
         "bbox_wgs84": bbox,
-        "n_timesteps": len(all_times),
+        "n_timesteps": len(master_times),
         "n_variables": len(aligned),
         "variables": [da.name for da in aligned],
     }
@@ -330,26 +396,9 @@ def _process_event(
 
     log.info(
         "✓ %s — %d vars × %d timesteps × %d×%d",
-        event_id, len(aligned), len(all_times), _GRID_SIZE, _GRID_SIZE,
+        event_id, len(aligned), len(master_times), _GRID_SIZE, _GRID_SIZE,
     )
     return ds
-
-
-# ---------------------------------------------------------------------------
-# Train / val / test split by year (no temporal leakage)
-# ---------------------------------------------------------------------------
-
-def _assign_split(year: int, years: list[int]) -> str:
-    sorted_years = sorted(set(years))
-    n = len(sorted_years)
-    train_end = int(n * cfg.training.train_val_test_split[0])
-    val_end = train_end + int(n * cfg.training.train_val_test_split[1])
-    idx = sorted_years.index(year) if year in sorted_years else 0
-    if idx < train_end:
-        return "train"
-    elif idx < val_end:
-        return "val"
-    return "test"
 
 
 # ---------------------------------------------------------------------------
@@ -451,13 +500,11 @@ def build(
 
     fs = s3fs.S3FileSystem(anon=True)
 
-    all_years = [t.year for t in gdf["start_time"].dt.to_pydatetime()]
-    index_rows: list[dict] = []
-
     # Load running stats (accumulate across batches)
     running_stats_path = Path(cfg.data.stats_path).with_suffix(".running.json")
     running_stats = _load_running_stats(running_stats_path) if resume else {}
 
+    events_processed = 0
     for _, row in tqdm(valid.iterrows(), total=len(valid), desc="Building Zarr"):
         event_id = str(row["event_id"])
         dt_start = row["start_time"].to_pydatetime()
@@ -470,37 +517,12 @@ def build(
             continue
 
         _update_stats(running_stats, ds)
-
-        index_rows.append({
-            "event_id": event_id,
-            "zarr_path": str(events_dir / event_id / "data.zarr"),
-            "ef_rating": row.get("ef_rating"),
-            "start_time": dt_start,
-            "end_time": dt_end,
-            "year": dt_start.year,
-            "split": _assign_split(dt_start.year, all_years),
-            "state": row.get("state"),
-        })
+        events_processed += 1
 
     # Persist running stats (accumulates across batches)
     if running_stats:
         with open(running_stats_path, "w") as f:
             json.dump(running_stats, f, indent=2)
-
-    # Write / merge index
-    index_path = Path(cfg.data.index_path)
-    if index_rows:
-        new_df = pd.DataFrame(index_rows)
-        if resume and index_path.exists():
-            existing = pd.read_parquet(index_path)
-            combined = pd.concat([existing, new_df]).drop_duplicates(
-                subset="event_id", keep="last"
-            )
-            combined.to_parquet(index_path, index=False)
-            log.info("Updated index → %s (%d total events)", index_path, len(combined))
-        else:
-            new_df.to_parquet(index_path, index=False)
-            log.info("Wrote index → %s (%d events)", index_path, len(new_df))
 
     # Write finalized stats (mean/std)
     stats = _finalize_stats(running_stats)
@@ -510,7 +532,7 @@ def build(
             json.dump(stats, f, indent=2)
         log.info("Wrote normalization stats → %s", stats_path)
 
-    log.info("Done. %d events processed this batch.", len(index_rows))
+    log.info("Done. %d events processed this batch. Run `uv run scan-events` to update index.parquet.", events_processed)
 
 
 # ---------------------------------------------------------------------------

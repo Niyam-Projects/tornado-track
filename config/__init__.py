@@ -32,7 +32,7 @@ class MRMSConfig(BaseModel):
     region: str = "us-east-1"
     anonymous: bool = True
     variables: List[str] = [
-        "ReflectivityQC",
+        "ReflectivityAtLowestAltitude",
         "AzShear_0-2kmAGL",
         "AzShear_3-6kmAGL",
         "MESH",
@@ -101,6 +101,19 @@ class InferenceConfig(BaseModel):
     output_format: str = "geojson"
 
 
+class CurriculumConfig(BaseModel):
+    monster_threshold: float = 0.015  # max_rotation_score s⁻¹ → Tier 1
+    weak_threshold: float = 0.005     # max_rotation_score s⁻¹ → Tier 3
+    stage1_tier: int = 1              # Stage 1 uses only Tier 1 events
+    stage2_tier: int = 2              # Stage 2 uses Tier 1+2 events
+    stage3_tier: int = 3              # Stage 3 uses all tiers
+
+
+class NormalizationConfig(BaseModel):
+    rotation_clip_low: float = 0.010   # s⁻¹ → maps to 0.0
+    rotation_clip_high: float = 0.040  # s⁻¹ → maps to 1.0
+
+
 class AppConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="TORNADO_")
 
@@ -112,12 +125,14 @@ class AppConfig(BaseSettings):
     training: TrainingConfig = TrainingConfig()
     model: ModelConfig = ModelConfig()
     inference: InferenceConfig = InferenceConfig()
+    curriculum: CurriculumConfig = CurriculumConfig()
+    normalization: NormalizationConfig = NormalizationConfig()
 
 
 def load_config(path: Path = _CONFIG_PATH) -> AppConfig:
     """Load config from YAML file, falling back to defaults."""
     if path.exists():
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             raw = yaml.safe_load(f)
         return AppConfig.model_validate(raw)
     return AppConfig()

@@ -40,7 +40,7 @@ _KM_PER_DEG_LAT = 111.0
 # Maps our logical variable names → actual S3 product folder names (verified live)
 # Pattern: CONUS/{S3_PRODUCT}/{YYYYMMDD}/MRMS_{S3_PRODUCT}_{YYYYMMDD}-{HHMMSS}.grib2.gz
 _S3_PRODUCT_MAP: dict[str, str] = {
-    "ReflectivityQC":       "MergedReflectivityQC_00.50",
+    "ReflectivityAtLowestAltitude": "ReflectivityAtLowestAltitude_00.50",
     "AzShear_0-2kmAGL":     "MergedAzShear_0-2kmAGL_00.50",
     "AzShear_3-6kmAGL":     "MergedAzShear_3-6kmAGL_00.50",
     "MESH":                 "MESH_00.50",

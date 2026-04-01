@@ -24,7 +24,12 @@ log = logging.getLogger(__name__)
 @click.command()
 @click.option("--episodes", default=None, type=int, help="Override episode count")
 @click.option("--checkpoint-in", default=None, help="Override Stage 1 checkpoint path")
-def main(episodes: int | None, checkpoint_in: str | None) -> None:
+@click.option(
+    "--tier", default=None, type=int,
+    help="Max curriculum tier to train on (1=Monster only, 2=Moderate+, 3=all). "
+         "Default: 2 (Stage 2 uses Monster + Moderate events).",
+)
+def main(episodes: int | None, checkpoint_in: str | None, tier: int | None) -> None:
     """Run Stage 2 (Hunter) PPO training."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -41,6 +46,7 @@ def main(episodes: int | None, checkpoint_in: str | None) -> None:
         checkpoint_in=ckpt_in,
         total_episodes=episodes,
         run_name="stage2_hunter",
+        min_tier=tier,
     )
     log.info("Stage 2 complete. Checkpoint: %s", ckpt)
 

@@ -20,19 +20,29 @@ uv run zarr-build                      # 100 most recent unprocessed events per 
 uv run zarr-build --batch-size 0       # all events (~6.4 days, ~200 GB)
 uv run zarr-build --workers 32         # more parallelism on fast connections
 
-# 4. Train Stage 1 — Follower (~6 hrs on GPU)
-uv run train-stage1
+# 4. Scan events for signal quality — scores every event by RotationTrack60min peak intensity,
+#    classifies into Monster / Moderate / Weak tiers, and updates index.parquet.
+uv run scan-events                     # scan all events
+uv run scan-events --report-only       # print quality report without writing to index
 
-# 5. Train Stage 2 — Hunter (~6 hrs on GPU)
-uv run train-stage2
+# 4a. (Optional) Visualize events locally in a browser to inspect radar signal vs DAT track
+uv run viz-events                      # opens http://localhost:8501
 
-# 6. Train Stage 3 — Surveyor (~8 hrs on GPU)
-uv run train-stage3
+# 5. Train Stage 1 — Follower (~6 hrs on GPU)
+#    By default, Stage 1 trains only on Tier 1 "Monster" events (Kankakee Curriculum)
+uv run train-stage1                    # Monster events only (--tier 1 default)
+uv run train-stage1 --tier 2           # expand to Monster + Moderate
 
-# 7. Evaluate the trained model against the held-out test split
+# 6. Train Stage 2 — Hunter (~6 hrs on GPU)
+uv run train-stage2                    # Monster + Moderate events (--tier 2 default)
+
+# 7. Train Stage 3 — Surveyor (~8 hrs on GPU)
+uv run train-stage3                    # all events (--tier 3 default)
+
+# 8. Evaluate the trained model against the held-out test split
 uv run evaluate
 
-# 8. Run inference on a specific time window and bounding box
+# 9. Run inference on a specific time window and bounding box
 uv run predict --start "2023-05-06T22:00:00Z" --end "2023-05-07T00:30:00Z" --bbox "-99.5,35.0,-98.0,36.5" --output my_track.geojson
 ```
 
@@ -55,7 +65,7 @@ uv run tensorboard --logdir "E:\projects\tornado-track\reports\tensorboard"
 > **GRIB2 support:** `zarr-build` uses the `eccodes` C library directly for fast GRIB2
 > decoding (~35× faster than cfgrib). On Windows the easiest install is
 > `conda install -c conda-forge eccodes`. Without it, the Zarr build step will fail.
-> Steps 1, 4–8 do not require it.
+> Steps 1, 4–9 do not require it.
 
 ---
 
@@ -77,6 +87,19 @@ training:
 
 model:
   ef_classification: true    # set false to skip EF rating head
+
+# Kankakee Curriculum — SNR tier thresholds (populated by scan-events)
+curriculum:
+  monster_threshold: 0.015   # peak RotationTrack60min s⁻¹ → Tier 1 "Monster"
+  weak_threshold: 0.005      # peak RotationTrack60min s⁻¹ → Tier 3 "Weak"
+  stage1_tier: 1             # Stage 1 trains only on Monster events
+  stage2_tier: 2             # Stage 2 adds Moderate events
+  stage3_tier: 3             # Stage 3 uses all events
+
+# Rotation channel normalization — Clipped Robust Scaler
+normalization:
+  rotation_clip_low: 0.010   # s⁻¹ below this → 0.0 (background suppressed)
+  rotation_clip_high: 0.040  # s⁻¹ at or above this → 1.0 (Kankakee-scale peak)
 ```
 
 ---
@@ -162,7 +185,75 @@ Resume mode is on by default — re-runs skip events that already have a Zarr st
 
 ---
 
-### Step 3 — Train Stage 1: Follower
+### Step 3 — Scan events for signal quality
+
+```powershell
+uv run scan-events
+```
+
+Reads each downloaded Zarr store, extracts the peak `RotationTrack60min` value, and
+classifies events into **three quality tiers** for the Kankakee Curriculum:
+
+| Tier | Name | Threshold | Training use |
+|------|------|-----------|--------------|
+| 1 | **Monster** | `max_rotation_score > 0.015 s⁻¹` | Stage 1 core training (high-SNR "type specimens") |
+| 2 | **Moderate** | `0.005–0.015 s⁻¹` | Introduced in Stage 2 curriculum |
+| 3 | **Weak** | `< 0.005 s⁻¹` | Stage 3 (all events, including messy/low-signal) |
+
+New columns added to `index.parquet`:
+
+| Column | Description |
+|--------|-------------|
+| `max_rotation_score` | Peak `RotationTrack60min` value (s⁻¹) across all timesteps |
+| `mean_rotation_core` | Mean of pixels exceeding the weak threshold |
+| `active_pixel_count` | Count of above-threshold pixels |
+| `n_timesteps` | T dimension of the Zarr store |
+| `data_completeness` | Fraction of the 8 expected MRMS variables present |
+| `rotation_tier` | `"monster"` / `"moderate"` / `"weak"` |
+| `curriculum_stage` | `1` / `2` / `3` — matches the `--tier` flag on train scripts |
+
+Options:
+```powershell
+uv run scan-events --report-only                     # print report, don't write index
+uv run scan-events --monster-threshold 0.020         # custom tier boundary
+uv run scan-events --force                           # re-scan already-scored events
+```
+
+**Runtime:** ~5–30 seconds for 100 events (reads only one channel per zarr, lazy I/O).
+
+---
+
+### Step 3a — Visualize events (optional)
+
+```powershell
+uv run viz-events
+# opens http://localhost:8501
+```
+
+Launches a local Streamlit web app that lets you visually inspect downloaded events
+before training. Designed for the "Type Specimen" workflow — see a MRMS frame,
+toggle layers, and compare the radar signal against the NOAA DAT ground-truth track.
+
+**Features:**
+- Event selector dropdown (sorted by `max_rotation_score` if scan-events has been run)
+- Timestep slider — step through the MRMS radar frame by frame
+- Per-layer toggles + opacity sliders for all 8 MRMS channels
+- Normalization range sliders (min/max clamp) per layer to tune contrast
+- Color scheme selector per layer (viridis, plasma, turbo, RdBu, etc.)
+- Folium interactive map with MRMS rendered as image overlays
+- **DAT Track overlay** — the known tornado path as a colored polyline (EF-rated)
+- **EF Damage Polygon overlay** — surveyed damage zones by EF rating
+- **Damage Survey Points** — individual field survey locations with EF scale and windspeed
+- Event metadata panel: EF rating, start/end time, quality tier, max rotation score
+
+Options:
+```powershell
+uv run viz-events --port 8502    # use a different port
+```
+
+---
+
+### Step 4 — Train Stage 1: Follower
 
 ```powershell
 uv run train-stage1
@@ -172,6 +263,8 @@ Agent spawns directly on the known DAT track at t=0 and learns that high
 `RotationTrack30min` + high reflectivity = reward. Teaches the physics of following
 an active tornado.
 
+By default, Stage 1 trains only on **Tier 1 "Monster" events** (see [Kankakee Curriculum](#kankakee-curriculum--signal-quality-tiers)). This prevents the model from being confused by low-SNR events during the critical first phase of learning.
+
 - Episodes: **5,000**
 - Checkpoint: `E:\projects\tornado-track\checkpoints\stage1\checkpoint_final.pt`
 - TensorBoard logs: `E:\projects\tornado-track\reports\tensorboard\stage1_follower_*\`
@@ -179,13 +272,15 @@ an active tornado.
 Options:
 ```powershell
 uv run train-stage1 --episodes 100    # quick smoke test
+uv run train-stage1 --tier 2          # expand to Monster + Moderate once Stage 1 converges
+uv run train-stage1 --tier 3          # use all events (no SNR filter)
 ```
 
 **Runtime:** ~6 hrs on GPU.
 
 ---
 
-### Step 4 — Train Stage 2: Hunter
+### Step 5 — Train Stage 2: Hunter
 
 ```powershell
 uv run train-stage2
@@ -193,7 +288,7 @@ uv run train-stage2
 
 Agent spawns ~15 min before touchdown and must navigate toward intensifying
 `RotationTrackML` signatures. Teaches the model to anticipate tornado initiation.
-Auto-loads the Stage 1 checkpoint.
+Auto-loads the Stage 1 checkpoint. Default: Tier 1 + Tier 2 events.
 
 - Episodes: **5,000**
 - Checkpoint: `E:\projects\tornado-track\checkpoints\stage2\checkpoint_final.pt`
@@ -202,13 +297,14 @@ Options:
 ```powershell
 uv run train-stage2 --checkpoint-in "E:\projects\tornado-track\checkpoints\stage1\checkpoint_final.pt"
 uv run train-stage2 --episodes 2000
+uv run train-stage2 --tier 1          # keep Monster-only if reward isn't yet converged
 ```
 
 **Runtime:** ~6 hrs on GPU.
 
 ---
 
-### Step 5 — Train Stage 3: Surveyor
+### Step 6 — Train Stage 3: Surveyor
 
 ```powershell
 uv run train-stage3
@@ -216,6 +312,7 @@ uv run train-stage3
 
 Full lifecycle episodes from clear-sky through post-storm. Model must correctly signal
 tornado touchdown and lift. Heavy penalty for false positives. Auto-loads Stage 2 checkpoint.
+Default: all tiers (Tier 1 + 2 + 3).
 
 - Episodes: **5,000**
 - Checkpoint: `E:\projects\tornado-track\checkpoints\stage3\checkpoint_final.pt`
@@ -229,7 +326,7 @@ uv run train-stage3 --checkpoint-in "E:\projects\tornado-track\checkpoints\stage
 
 ---
 
-### Step 6 — Evaluate
+### Step 7 — Evaluate
 
 ```powershell
 uv run evaluate
@@ -256,7 +353,7 @@ uv run evaluate --checkpoint "E:\projects\tornado-track\checkpoints\stage3\check
 
 ---
 
-### Step 7 — Inference
+### Step 8 — Inference
 
 ```powershell
 uv run predict `
@@ -290,28 +387,33 @@ uv run predict ... --checkpoint "E:\projects\tornado-track\checkpoints\stage3\ch
 ```
 tornado-track/
 ├── config/
-│   ├── __init__.py             ← pydantic config loader
-│   └── config.yaml             ← all settings (paths, hyperparams, MRMS variables)
+│   ├── __init__.py             ← pydantic config loader (AppConfig)
+│   └── config.yaml             ← all settings (paths, hyperparams, MRMS variables,
+│                                              curriculum tiers, normalization thresholds)
 ├── data/
 │   ├── dat_ingest.py           ← NOAA DAT → GeoParquet (tracks, EF polygons, damage points)
 │   ├── build_zarr_store.py     ← S3 streaming → eccodes decode → Zarr (main pipeline)
+│   ├── scan_events.py          ← SNR scoring → rotation tiers → index.parquet enrichment
 │   ├── mrms_download.py        ← [legacy] sequential boto3 GRIB downloader
 │   ├── mrms_download_fast.py   ← [legacy] async GRIB downloader with cached index
 │   └── grib_to_xarray.py       ← [legacy] GRIB2 → xarray (lon 0-360 → WGS84)
 ├── env/
-│   └── tornado_env.py          ← Gymnasium environment (3 spawn modes)
+│   └── tornado_env.py          ← Gymnasium environment (3 spawn modes, tier filtering,
+│                                              Clipped Robust Scaler normalization)
 ├── model/
 │   ├── policy.py               ← CNN + LSTM actor-critic (Actor, Lifecycle, EF heads)
-│   └── reward.py               ← Reward: polygon IoU + RotationTrack anchor + lifecycle
+│   └── reward.py               ← Reward: track proximity + RotationTrack anchor + lifecycle
 ├── training/
 │   ├── ppo_base.py             ← CleanRL-style PPO loop (GAE, minibatch, TensorBoard)
-│   ├── stage1_follower.py      ← Stage 1: Follower
-│   ├── stage2_hunter.py        ← Stage 2: Hunter
-│   └── stage3_surveyor.py      ← Stage 3: Surveyor
+│   ├── stage1_follower.py      ← Stage 1: Follower (--tier 1 default)
+│   ├── stage2_hunter.py        ← Stage 2: Hunter (--tier 2 default)
+│   └── stage3_surveyor.py      ← Stage 3: Surveyor (--tier 3 default)
 ├── evaluation/
 │   └── evaluate.py             ← Metrics (Hausdorff, IoU, Lifecycle F1, EF accuracy) + plots
 ├── inference/
 │   └── predict.py              ← CLI → GeoJSON (track + 1σ/2σ swath + touchdown/lift)
+├── viz/
+│   └── event_viewer.py         ← Streamlit local event viewer (MRMS layers + DAT overlays)
 ├── pyproject.toml              ← uv project + script entrypoints
 ├── requirements.txt            ← pip-compatible fallback
 ├── PLAN.md                     ← implementation plan
@@ -342,13 +444,42 @@ Gaussian actor and computing the 1σ and 2σ spatial envelopes of the sampled pa
 
 ## Training curriculum
 
-| Stage | Name | Spawn point | Key reward signal |
-|-------|------|-------------|-------------------|
-| 1 | **Follower** | On DAT track at t=0 | `RotationTrack30min` + reflectivity overlap |
-| 2 | **Hunter** | 15 min before touchdown | Approach intensifying `RotationTrackML` |
-| 3 | **Surveyor** | t=0 (clear-sky) | Lifecycle accuracy; heavy penalty for false actives |
+| Stage | Name | Spawn point | Key reward signal | Default tier |
+|-------|------|-------------|-------------------|--------------|
+| 1 | **Follower** | On DAT track at t=0 | `RotationTrack30min` + reflectivity overlap | Tier 1 Monster only |
+| 2 | **Hunter** | 15 min before touchdown | Approach intensifying `RotationTrackML` | Tier 1+2 |
+| 3 | **Surveyor** | t=0 (clear-sky) | Lifecycle accuracy; heavy penalty for false actives | All tiers |
 
 Each stage warm-starts from the previous stage's checkpoint.
+
+### Kankakee Curriculum — Signal Quality Tiers
+
+Training on all events simultaneously causes **SNR collapse**: if the model sees 60 weak
+events where `RotationTrack60min` never exceeds 0.005 s⁻¹ before hitting a Kankakee-style
+event at 0.044 s⁻¹, the gradient updates will be conflicted and convergence will be slow.
+
+The solution is **Prioritized Experience Replay by Signal Quality**. Events are scored
+by `scan-events` and classified into tiers:
+
+| Tier | Label | `max_rotation_score` | Strategy |
+|------|-------|----------------------|----------|
+| 1 | **Monster** | > 0.015 s⁻¹ | Stage 1 "type specimens" — the CNN sees only clear, high-contrast examples |
+| 2 | **Moderate** | 0.005–0.015 s⁻¹ | Introduced in Stage 2 once the model knows what a tornado looks like |
+| 3 | **Weak** | ≤ 0.005 s⁻¹ | Messy/low-signal events; introduced in Stage 3 for generalization |
+
+**Rotation normalization** uses a Clipped Robust Scaler (not Z-score) to ensure full
+CNN contrast on the Monster events:
+
+```
+x_norm = clip( (x - 0.010) / (0.040 - 0.010),  0,  1 )
+```
+
+- Below 0.010 s⁻¹ → `0.0` (background suppressed / dark)
+- At 0.040 s⁻¹ → `1.0` (Kankakee-scale peak = full brightness)
+- Values between → linearly stretched across full [0, 1] contrast range
+
+This replaces the old `clip(x / 0.01, 0, 1)` scaler that mapped anything above 0.010 s⁻¹
+to a flat `1.0`, making a strong event indistinguishable from a moderate one.
 
 ---
 
@@ -365,8 +496,13 @@ AWS s3://noaa-mrms-pds ──────────────┐
                                      │
         build_zarr_store.py  ◄───────┘  (streams GRIB2 directly via s3fs + eccodes)
               ├─► events\{event_id}\data.zarr   (C=8, T, H=200, W=200)
-              ├─► index.parquet                 (train/val/test by year)
+              ├─► index.parquet                 (train/val/test split)
               └─► stats.json                    (channel mean/std)
+                    │
+        scan_events.py  ◄──────────────────  reads RotationTrack60min per event
+              └─► index.parquet (enriched)    adds max_rotation_score + tier columns
+                    │
+        viz/event_viewer.py  ◄─────────────  Streamlit: MRMS layers + DAT overlays
 ```
 
 
@@ -560,7 +696,42 @@ Running stats are accumulated across batches so you can process events increment
 
 ---
 
-### Step 3 — Train Stage 1: Follower
+### Step 3 — Scan events for signal quality
+
+```powershell
+uv run scan-events
+```
+
+Reads each Zarr store, computes the peak `RotationTrack60min` value, and classifies
+events into tiers for the **Kankakee Curriculum**. See [Step 3 above](#step-3--scan-events-for-signal-quality)
+for full details. After this step, `index.parquet` contains `max_rotation_score`,
+`rotation_tier`, and `curriculum_stage` columns used by the training scripts.
+
+---
+
+### Step 3a — Visualize events (optional)
+
+```powershell
+uv run viz-events
+# opens http://localhost:8501
+```
+
+Launches a local Streamlit app to inspect individual events on an interactive map before
+training. Features:
+
+- Full-screen Folium map (cartodbpositron default) with sidebar controls
+- All 8 MRMS channels as toggleable image overlays (per-channel colormap, opacity, value range)
+- DAT track, EF damage polygons, and damage survey point overlays
+- Timestep slider to scrub through the radar time series frame by frame
+- **Summary tab** with tier distribution counts and the full quality report table
+
+```powershell
+uv run viz-events --port 8502    # use a different port
+```
+
+---
+
+### Step 4 — Train Stage 1: Follower
 
 ```powershell
 uv run python -m training.stage1_follower
@@ -569,6 +740,8 @@ uv run python -m training.stage1_follower
 **What it does:** Spawns the RL agent directly on the known DAT track at t=0.
 The agent learns that high `RotationTrack30min` + high reflectivity = reward.
 This teaches the model the **physics of following an active tornado track**.
+
+By default, Stage 1 trains only on **Tier 1 "Monster" events** (see [Kankakee Curriculum](#kankakee-curriculum--signal-quality-tiers)).
 
 - Episodes: **5,000** (configurable with `--episodes N`)
 - Checkpoint saved to: `E:\projects\tornado-track\checkpoints\stage1\checkpoint_final.pt`
@@ -582,15 +755,15 @@ Then open `http://localhost:6006` in a browser.
 
 **Options:**
 ```powershell
-# Run fewer episodes for a quick test
 uv run python -m training.stage1_follower --episodes 100
+uv run python -m training.stage1_follower --tier 2   # expand to Monster + Moderate
 ```
 
 **Expected runtime:** 4–24 hours depending on GPU. With an NVIDIA RTX-class GPU, ~6 hours.
 
 ---
 
-### Step 4 — Train Stage 2: Hunter
+### Step 5 — Train Stage 2: Hunter
 
 ```powershell
 uv run python -m training.stage2_hunter
@@ -601,17 +774,14 @@ environment. The agent must navigate toward intensifying `RotationTrackML` (mid-
 signatures. This teaches the model to **anticipate tornado initiation** by watching the
 mid-levels descend.
 
-Automatically loads the Stage 1 checkpoint as the starting point.
+Automatically loads the Stage 1 checkpoint as the starting point. Default: Tier 1+2 events.
 
 - Episodes: **5,000**
 - Checkpoint saved to: `E:\projects\tornado-track\checkpoints\stage2\checkpoint_final.pt`
 
 **Options:**
 ```powershell
-# Use a specific Stage 1 checkpoint
 uv run python -m training.stage2_hunter --checkpoint-in "E:\projects\tornado-track\checkpoints\stage1\checkpoint_final.pt"
-
-# Override episode count
 uv run python -m training.stage2_hunter --episodes 2000
 ```
 
@@ -619,7 +789,7 @@ uv run python -m training.stage2_hunter --episodes 2000
 
 ---
 
-### Step 5 — Train Stage 3: Surveyor
+### Step 6 — Train Stage 3: Surveyor
 
 ```powershell
 uv run python -m training.stage3_surveyor
@@ -630,14 +800,13 @@ period. The model must correctly signal tornado start (touchdown) and end (lift)
 A heavy **cost-of-effort penalty** is applied for every step the model claims a tornado
 is active when the DAT shows no damage.
 
-Automatically loads the Stage 2 checkpoint as the starting point.
+Automatically loads the Stage 2 checkpoint as the starting point. Default: all tiers.
 
 - Episodes: **5,000**
 - Checkpoint saved to: `E:\projects\tornado-track\checkpoints\stage3\checkpoint_final.pt`
 
 **Options:**
 ```powershell
-# Use a specific Stage 2 checkpoint
 uv run python -m training.stage3_surveyor --checkpoint-in "E:\projects\tornado-track\checkpoints\stage2\checkpoint_final.pt"
 ```
 
@@ -645,7 +814,7 @@ uv run python -m training.stage3_surveyor --checkpoint-in "E:\projects\tornado-t
 
 ---
 
-### Step 6 — Evaluate the trained model
+### Step 7 — Evaluate the trained model
 
 ```powershell
 uv run python -m evaluation.evaluate
@@ -676,7 +845,7 @@ uv run python -m evaluation.evaluate --checkpoint "E:\projects\tornado-track\che
 
 ---
 
-### Step 7 — Run local inference
+### Step 8 — Run local inference
 
 ```powershell
 uv run python -m inference.predict `

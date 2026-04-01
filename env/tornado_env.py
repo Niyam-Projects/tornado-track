@@ -58,6 +58,7 @@ class TornadoTrackEnv(gym.Env):
         stats_path: str | Path | None = None,
         stage: int = 1,
         split: str = "train",
+        min_tier: int | None = None,
     ):
         super().__init__()
 
@@ -67,7 +68,26 @@ class TornadoTrackEnv(gym.Env):
         # Load event index
         idx_path = Path(index_path or cfg.data.index_path)
         self._index = pd.read_parquet(idx_path)
-        self._index = self._index[self._index["split"] == split].reset_index(drop=True)
+        self._index = self._index[self._index["split"] == split]
+
+        # Tier filtering: only use events at or below the requested curriculum tier.
+        # Tier 1 = Monster (highest signal), Tier 2 = Moderate, Tier 3 = Weak/all.
+        # Falls back gracefully if scan-events has not been run yet.
+        if min_tier is not None and "curriculum_stage" in self._index.columns:
+            before = len(self._index)
+            self._index = self._index[self._index["curriculum_stage"] <= min_tier]
+            log.info(
+                "Tier filter (min_tier=%d): %d → %d events in %s split",
+                min_tier, before, len(self._index), split,
+            )
+        elif min_tier is not None:
+            log.warning(
+                "min_tier=%d requested but 'curriculum_stage' column not found in index — "
+                "run `uv run scan-events` first. Using all events.",
+                min_tier,
+            )
+
+        self._index = self._index.reset_index(drop=True)
 
         # Load normalization stats
         stats_file = Path(stats_path or cfg.data.stats_path)
@@ -125,6 +145,27 @@ class TornadoTrackEnv(gym.Env):
         present = [v for v in cfg.mrms.variables if v in zarr_vars]
         data = ds[present].to_array(dim="channel").sel(channel=present).values  # (C, T, H, W)
 
+        # Filter time axis to steps where RotationTrack60min has valid data.
+        # Existing zarrs built with the union time axis contain NaN frames for
+        # RotationTrack at reflectivity-only timestamps — drop those here so the
+        # agent always steps at the primary tornado-detection cadence.
+        rot_filter_var = next(
+            (v for v in ["RotationTrack60min", "RotationTrack30min"] if v in present),
+            None,
+        )
+        valid_t: np.ndarray | None = None
+        if rot_filter_var is not None:
+            rot_c = present.index(rot_filter_var)
+            rot_frames = data[rot_c]  # (T, H, W)
+            has_data = np.any(np.isfinite(rot_frames) & (rot_frames != 0.0), axis=(1, 2))
+            if not has_data.all():
+                valid_t = np.where(has_data)[0]
+                log.info(
+                    "Event %s: filtering %d → %d timesteps using %s valid frames",
+                    row.get("event_id"), data.shape[1], len(valid_t), rot_filter_var,
+                )
+                data = data[:, valid_t, :, :]
+
         if len(present) < _N_CHANNELS:
             # Pad missing channels with zeros so observation shape stays constant
             pad = np.zeros((_N_CHANNELS - len(present), *data.shape[1:]), dtype=data.dtype)
@@ -140,9 +181,12 @@ class TornadoTrackEnv(gym.Env):
         self._grid_lon = ds.coords.get("x", ds.coords.get("longitude", None))
         self._grid_lon = np.array(self._grid_lon) if self._grid_lon is not None else np.linspace(0, 1, _GRID_SIZE)
 
-        # Extract zarr time coordinate for active-flag computation
+        # Extract zarr time coordinate for active-flag computation; apply the
+        # same RotationTrack filter so active_steps aligns with the filtered data.
         _zt = ds.coords.get("time", ds.coords.get("t", None))
         zarr_times = pd.DatetimeIndex(_zt.values) if _zt is not None else None
+        if valid_t is not None and zarr_times is not None:
+            zarr_times = zarr_times[valid_t]
 
         # Load DAT track and derive active timestep flags
         self._dat_track, self._dat_polygon, self._active_steps = self._load_dat_info(row, zarr_times)
@@ -214,16 +258,25 @@ class TornadoTrackEnv(gym.Env):
     def _normalize(self, data: np.ndarray) -> np.ndarray:
         """Normalize each channel.
 
-        Rotation channels use a clipped linear scaler so that the 0.01 s^-1
-        threshold maps cleanly to 1.0 for the CNN -- preventing the strong core
-        signal from being washed out by a high background standard deviation.
+        Rotation channels use a Clipped Robust Scaler that maps the physically
+        meaningful rotation range to [0, 1] with background suppression:
+
+            x_norm = clip((x - rot_low) / (rot_high - rot_low), 0, 1)
+
+        This ensures that:
+        - Background noise (< rot_low s⁻¹) maps to 0 (dark)
+        - Kankakee-scale cores (≥ rot_high s⁻¹) map to 1 (full brightness)
+        - The full [rot_low, rot_high] range gets contrast-stretched across [0, 1]
 
         All other channels use Z-score normalization via pre-computed stats.
         """
+        rot_low = cfg.normalization.rotation_clip_low
+        rot_high = cfg.normalization.rotation_clip_high
+        rot_range = max(rot_high - rot_low, 1e-8)
+
         for i, var in enumerate(cfg.mrms.variables):
             if "RotationTrack" in var:
-                # Clipped linear: 0.01 s^-1 -> 1.0 (max brightness)
-                data[i] = np.clip(data[i] / 0.01, 0.0, 1.0)
+                data[i] = np.clip((data[i] - rot_low) / rot_range, 0.0, 1.0)
             elif var in self._stats:
                 mean = self._stats[var]["mean"]
                 std = max(self._stats[var]["std"], 1e-8)

@@ -30,7 +30,7 @@ mrms:
   region: "us-east-1"
   anonymous: true              # Public bucket — no credentials needed
   variables:
-    - "ReflectivityQC"
+    - "ReflectivityAtLowestAltitude"
     - "AzShear_0-2kmAGL"
     - "AzShear_3-6kmAGL"
     - "MESH"
@@ -99,6 +99,27 @@ model:
   lifecycle_hidden: 64
   ef_classification: true      # Enable EF-level head (optional)
   ef_classes: 6                # EF0–EF5
+
+# ---------------------------------------------------------------------------
+# Event quality tiers — Kankakee Curriculum (SNR filtering)
+# Run `uv run scan-events` to populate max_rotation_score in index.parquet
+# ---------------------------------------------------------------------------
+curriculum:
+  monster_threshold: 0.015   # max_rotation_score (s⁻¹) → Tier 1 "Monster"
+  weak_threshold: 0.005      # max_rotation_score (s⁻¹) → Tier 3 "Weak"
+  stage1_tier: 1             # Stage 1 trains ONLY on Tier 1 (Monster) events
+  stage2_tier: 2             # Stage 2 introduces Tier 1+2 events
+  stage3_tier: 3             # Stage 3 uses all tiers
+
+# ---------------------------------------------------------------------------
+# Rotation channel normalization — Clipped Robust Scaler
+# Maps [rotation_clip_low, rotation_clip_high] → [0, 1]
+# Values below low → 0 (background suppression)
+# Values above high → 1 (hard cap)
+# ---------------------------------------------------------------------------
+normalization:
+  rotation_clip_low: 0.010   # s⁻¹ → maps to 0.0 (suppress background noise)
+  rotation_clip_high: 0.040  # s⁻¹ → maps to 1.0 (Kankakee-scale peak at ~44 display units)
 
 # ---------------------------------------------------------------------------
 # Inference
