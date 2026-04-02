@@ -267,7 +267,9 @@ By default, Stage 1 trains only on **Tier 1 "Monster" events** (see [Kankakee Cu
 
 - Episodes: **5,000**
 - Checkpoint: `E:\projects\tornado-track\checkpoints\stage1\checkpoint_final.pt`
+- Periodic checkpoints: `checkpoint_ep500.pt`, `checkpoint_ep1000.pt`, … every 500 episodes
 - TensorBoard logs: `E:\projects\tornado-track\reports\tensorboard\stage1_follower_*\`
+- Episode history CSV: `E:\projects\tornado-track\reports\episode_history_stage1_follower_*.csv`
 
 Options:
 ```powershell
@@ -275,6 +277,8 @@ uv run train-stage1 --episodes 100    # quick smoke test
 uv run train-stage1 --tier 2          # expand to Monster + Moderate once Stage 1 converges
 uv run train-stage1 --tier 3          # use all events (no SNR filter)
 ```
+
+Press **Ctrl+C** at any time to interrupt gracefully — a `checkpoint_interrupt.pt` is saved automatically.
 
 **Runtime:** ~6 hrs on GPU.
 
@@ -292,6 +296,7 @@ Auto-loads the Stage 1 checkpoint. Default: Tier 1 + Tier 2 events.
 
 - Episodes: **5,000**
 - Checkpoint: `E:\projects\tornado-track\checkpoints\stage2\checkpoint_final.pt`
+- Periodic checkpoints every 500 episodes
 
 Options:
 ```powershell
@@ -316,6 +321,7 @@ Default: all tiers (Tier 1 + 2 + 3).
 
 - Episodes: **5,000**
 - Checkpoint: `E:\projects\tornado-track\checkpoints\stage3\checkpoint_final.pt`
+- Periodic checkpoints every 500 episodes
 
 Options:
 ```powershell
@@ -350,6 +356,24 @@ Options:
 uv run evaluate --split val
 uv run evaluate --checkpoint "E:\projects\tornado-track\checkpoints\stage3\checkpoint_final.pt"
 ```
+
+---
+
+### Step 7b — Diagnose bad training events (Wall of Shame)
+
+```powershell
+uv run wall-of-shame
+```
+
+Reads `episode_history_*.csv` produced during training and ranks events by worst mean reward. Use this to identify data-poisoners that are driving reward nose-dives in TensorBoard.
+
+```powershell
+uv run wall-of-shame --top 20          # show 20 worst events
+uv run wall-of-shame --threshold -50   # custom flag threshold
+uv run wall-of-shame --quarantine      # write quarantine.txt for removal
+```
+
+See [Step 7b](#step-7b--diagnose-bad-training-events-wall-of-shame-1) in the full reference for complete details.
 
 ---
 
@@ -744,8 +768,10 @@ This teaches the model the **physics of following an active tornado track**.
 By default, Stage 1 trains only on **Tier 1 "Monster" events** (see [Kankakee Curriculum](#kankakee-curriculum--signal-quality-tiers)).
 
 - Episodes: **5,000** (configurable with `--episodes N`)
-- Checkpoint saved to: `E:\projects\tornado-track\checkpoints\stage1\checkpoint_final.pt`
+- Final checkpoint: `E:\projects\tornado-track\checkpoints\stage1\checkpoint_final.pt`
+- Periodic checkpoints: `checkpoint_ep500.pt`, `checkpoint_ep1000.pt`, … (every 500 episodes, configurable via `training.checkpoint_interval` in `config.yaml`)
 - TensorBoard logs: `E:\projects\tornado-track\reports\tensorboard\stage1_follower_*\`
+- Episode history CSV: `E:\projects\tornado-track\reports\episode_history_stage1_follower_*.csv`
 
 **Monitor training progress in real time:**
 ```powershell
@@ -758,6 +784,8 @@ Then open `http://localhost:6006` in a browser.
 uv run python -m training.stage1_follower --episodes 100
 uv run python -m training.stage1_follower --tier 2   # expand to Monster + Moderate
 ```
+
+Press **Ctrl+C** at any time to interrupt gracefully — a `checkpoint_interrupt.pt` is saved automatically before exiting.
 
 **Expected runtime:** 4–24 hours depending on GPU. With an NVIDIA RTX-class GPU, ~6 hours.
 
@@ -777,7 +805,8 @@ mid-levels descend.
 Automatically loads the Stage 1 checkpoint as the starting point. Default: Tier 1+2 events.
 
 - Episodes: **5,000**
-- Checkpoint saved to: `E:\projects\tornado-track\checkpoints\stage2\checkpoint_final.pt`
+- Final checkpoint: `E:\projects\tornado-track\checkpoints\stage2\checkpoint_final.pt`
+- Periodic checkpoints every 500 episodes
 
 **Options:**
 ```powershell
@@ -803,7 +832,8 @@ is active when the DAT shows no damage.
 Automatically loads the Stage 2 checkpoint as the starting point. Default: all tiers.
 
 - Episodes: **5,000**
-- Checkpoint saved to: `E:\projects\tornado-track\checkpoints\stage3\checkpoint_final.pt`
+- Final checkpoint: `E:\projects\tornado-track\checkpoints\stage3\checkpoint_final.pt`
+- Periodic checkpoints every 500 episodes
 
 **Options:**
 ```powershell
@@ -842,6 +872,52 @@ uv run python -m evaluation.evaluate --split val
 # Use a specific checkpoint
 uv run python -m evaluation.evaluate --checkpoint "E:\projects\tornado-track\checkpoints\stage3\checkpoint_final.pt"
 ```
+
+---
+
+### Step 7b — Diagnose bad training events (Wall of Shame)
+
+Every training run writes a per-episode CSV to `E:\projects\tornado-track\reports\episode_history_*.csv`. Use `wall-of-shame` to rank the worst-performing events so you can identify and remove data-poisoners.
+
+```powershell
+uv run wall-of-shame
+```
+
+**What it does:**
+
+- Auto-discovers the latest `episode_history_*.csv` in the reports directory
+- Groups by `event_id` and computes mean / min / max reward per event
+- Prints a ranked table sorted by worst mean reward
+- Flags events more than 2 standard deviations below the fleet average (auto-threshold)
+
+**Example output:**
+```
+💀  WALL OF SHAME — Worst-Performing Training Events
+═══════════════════════════════════════════════════════
+  Total unique events : 12
+  Total episodes      : 1,248
+  Flagging threshold  : -48.3
+
+  Event ID                         N   MeanRew   MinRew   Tier       LenMi  Steps
+  ─────────────────────────────────────────────────────────────────────────────────
+  Bad_Event_XYZ               💀   28   -123.4   -201.0   moderate     1.2     91
+  Weak_Short_Tornado               22    -12.1    -80.3   weak         0.8     88
+  Roseland                         31    142.3     68.1   monster      8.8     97
+  ...
+```
+
+**Options:**
+```powershell
+uv run wall-of-shame --top 20                  # show 20 worst events (default 10)
+uv run wall-of-shame --threshold -50           # custom flag threshold
+uv run wall-of-shame --csv path\to\file.csv    # explicit CSV path
+uv run wall-of-shame --quarantine              # write quarantine.txt + removal instructions
+uv run wall-of-shame --all                     # show all events ranked
+```
+
+**The `--quarantine` flag** writes `E:\projects\tornado-track\reports\quarantine.txt` containing the flagged event IDs and prints the exact Python one-liner to remove them from `index.parquet`. After removal, re-run `uv run scan-events` to rebuild the index.
+
+> **Tip:** A smaller "Gold Standard" dataset is always better than a large, noisy one in early training. If 5 events are responsible for 80% of your reward drops, remove them and restart.
 
 ---
 

@@ -83,6 +83,7 @@ class TrainingConfig(BaseModel):
     ent_coef: float = 0.01
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
+    checkpoint_interval: int = 500  # Save a checkpoint every N episodes
     reward: RewardConfig = RewardConfig()
     lifecycle: LifecycleConfig = LifecycleConfig()
 

@@ -72,18 +72,101 @@ _CRS = "EPSG:4326"
 # Train / val / test split by year (no temporal leakage)
 # ---------------------------------------------------------------------------
 
-def _assign_split(year: int, years: list[int]) -> str:
-    sorted_years = sorted(set(years))
-    n = len(sorted_years)
-    # Use max(1, ...) so at least one year lands in train even with a tiny dataset
-    train_end = max(1, int(n * cfg.training.train_val_test_split[0]))
-    val_end = train_end + int(n * cfg.training.train_val_test_split[1])
-    idx = sorted_years.index(year) if year in sorted_years else 0
-    if idx < train_end:
-        return "train"
-    elif idx < val_end:
-        return "val"
-    return "test"
+# ---------------------------------------------------------------------------
+# Train / val / test split assignment
+# ---------------------------------------------------------------------------
+
+def _assign_splits_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Assign train/val/test splits to every row of the event index.
+
+    Primary strategy: year-based (no temporal leakage — older years → train).
+
+    Fallback (when year-based produces empty val or test buckets, e.g. a
+    single-year dataset): sort events by descending quality —
+        1. length_mi  (longer tracks first)
+        2. n_timesteps (more steps second)
+        3. max_rotation_score (strongest rotation third)
+    — then assign by the configured ratios so the highest-quality events
+    are placed in the training split.
+    """
+    ratios = cfg.training.train_val_test_split  # [0.70, 0.15, 0.15]
+    n = len(df)
+    if n == 0:
+        return df
+
+    # --- Year-based assignment ---
+    valid_years = sorted(set(int(y) for y in df["year"].dropna()))
+    nu = len(valid_years)
+    train_end = max(1, int(nu * ratios[0]))
+    val_end = train_end + int(nu * ratios[1])
+
+    def _year_to_split(year) -> str:
+        if year is None or (isinstance(year, float) and np.isnan(year)):
+            return "train"
+        idx = valid_years.index(int(year)) if int(year) in valid_years else 0
+        if idx < train_end:
+            return "train"
+        if idx < val_end:
+            return "val"
+        return "test"
+
+    year_splits = df["year"].apply(_year_to_split)
+
+    # Check whether year-based produces at least one event in val AND test
+    needs_fallback = (year_splits == "val").sum() == 0 or (year_splits == "test").sum() == 0
+
+    if not needs_fallback:
+        df = df.copy()
+        df["split"] = year_splits
+        log.info(
+            "Split assignment (year-based): train=%d  val=%d  test=%d",
+            (year_splits == "train").sum(),
+            (year_splits == "val").sum(),
+            (year_splits == "test").sum(),
+        )
+        return df
+
+    # --- Quality-sorted fallback ---
+    log.info(
+        "Year-based split produces empty val/test buckets (%d unique year(s)). "
+        "Falling back to quality-sorted split: length_mi → n_timesteps → max_rotation_score.",
+        nu,
+    )
+
+    # Sort best-quality events first so they land in "train"
+    sort_cols = {
+        "length_mi": df["length_mi"].fillna(0) if "length_mi" in df.columns else pd.Series(0, index=df.index),
+        "n_timesteps": df["n_timesteps"].fillna(0) if "n_timesteps" in df.columns else pd.Series(0, index=df.index),
+        "max_rotation_score": df["max_rotation_score"].fillna(0) if "max_rotation_score" in df.columns else pd.Series(0, index=df.index),
+    }
+    sort_df = pd.DataFrame(sort_cols)
+    sorted_positions = sort_df.sort_values(
+        ["length_mi", "n_timesteps", "max_rotation_score"], ascending=False
+    ).index  # original DataFrame index labels, best-quality first
+
+    # Determine bucket sizes (minimum 1 for train; val/test only if enough events)
+    train_count = max(1, round(n * ratios[0]))
+    val_count = max(1, round(n * ratios[1])) if n >= 3 else 0
+    # test gets the remainder
+
+    splits = pd.Series("test", index=df.index)
+    for rank, orig_idx in enumerate(sorted_positions):
+        if rank < train_count:
+            splits[orig_idx] = "train"
+        elif rank < train_count + val_count:
+            splits[orig_idx] = "val"
+        # else stays "test"
+
+    df = df.copy()
+    df["split"] = splits
+    log.info(
+        "Split assignment (quality-sorted fallback): train=%d  val=%d  test=%d",
+        (splits == "train").sum(),
+        (splits == "val").sum(),
+        (splits == "test").sum(),
+    )
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -171,11 +254,6 @@ def _build_event_rows(
             "event_id", "zarr_path", "start_time", "end_time", "year",
             "n_timesteps", "ef_rating", "length_mi", "width_yd", "wfo", "geometry",
         ], geometry="geometry").set_crs(_CRS)
-
-    # Assign train/val/test splits by year (across all discovered events)
-    all_years = [r["year"] for r in rows if r["year"] is not None]
-    for r in rows:
-        r["split"] = _assign_split(r["year"], all_years) if r["year"] is not None else "train"
 
     gdf = gpd.GeoDataFrame(rows, geometry="geometry", crs=_CRS)
     log.info("Discovered %d completed events in %s", len(gdf), events_root)
@@ -539,6 +617,10 @@ def main(
         tiers = index.apply(_tier, axis=1)
         index["rotation_tier"] = tiers.apply(lambda t: t[0])
         index["curriculum_stage"] = tiers.apply(lambda t: t[1])
+
+    # Always re-assign splits post-merge so max_rotation_score is available for
+    # the quality-sorted fallback and cached events get fresh split assignments
+    index = _assign_splits_df(index)
 
     # Print report
     _print_report(index)

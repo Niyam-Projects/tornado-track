@@ -4,13 +4,15 @@ Shared CleanRL-style PPO training loop for all three curriculum stages.
 Each stage script calls `train_ppo(stage=N, ...)` which:
   1. Creates TornadoTrackEnv with the appropriate stage/spawn mode
   2. Runs the PPO update loop for `total_episodes` episodes
-  3. Logs to TensorBoard
-  4. Saves checkpoints to E:\\projects\\tornado-track\\checkpoints\\stage{N}\\
+  3. Logs to TensorBoard and a per-run episode_history CSV
+  4. Saves periodic checkpoints every cfg.training.checkpoint_interval episodes
+  5. Handles Ctrl+C gracefully by saving a checkpoint before exiting
 
 Reference: CleanRL PPO (https://github.com/vwxyzjn/cleanrl)
 """
 from __future__ import annotations
 
+import csv
 import logging
 import time
 from pathlib import Path
@@ -143,6 +145,49 @@ def _log_splits(env: "TornadoTrackEnv", stage: int) -> None:
     log.info("Split report written → %s", report_path)
 
 
+def _open_episode_csv(reports_dir: Path, run_name: str):
+    """
+    Open (or create) the episode history CSV for this run.
+
+    Returns (file_handle, csv.writer). Appends to an existing file so that
+    training restarts accumulate history rather than overwriting it.
+    """
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = reports_dir / f"episode_history_{run_name}.csv"
+    is_new = not csv_path.exists() or csv_path.stat().st_size == 0
+    fh = open(csv_path, "a", newline="", encoding="utf-8")
+    writer = csv.writer(fh)
+    if is_new:
+        writer.writerow([
+            "episode", "global_step", "event_id", "episode_reward", "episode_steps",
+            "stage", "rotation_tier", "length_mi", "n_timesteps", "max_rotation_score",
+        ])
+        fh.flush()
+    log.info("Episode history CSV → %s", csv_path)
+    return fh, writer
+
+
+def _save_checkpoint(
+    policy: "TornadoPolicy",
+    optimizer: "optim.Adam",
+    stage: int,
+    episode_count: int,
+    global_step: int,
+    run_name: str,
+    ckpt_path: Path,
+) -> None:
+    """Save a full training checkpoint (policy + optimizer state for resuming)."""
+    torch.save({
+        "policy": policy.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "stage": stage,
+        "episode_count": episode_count,
+        "global_step": global_step,
+        "run_name": run_name,
+    }, str(ckpt_path))
+    log.info("Checkpoint saved → %s  (ep=%d, step=%d)", ckpt_path, episode_count, global_step)
+
+
 # ---------------------------------------------------------------------------
 # Main training function
 # ---------------------------------------------------------------------------
@@ -196,12 +241,15 @@ def train_ppo(
 
     optimizer = optim.Adam(policy.parameters(), lr=tc.learning_rate, eps=1e-5)
 
+    reports_dir = Path(cfg.data.reports_dir)
+    csv_fh, csv_writer = _open_episode_csv(reports_dir, run_name)
+
     buf = RolloutBuffer(tc.n_steps, obs_shape, action_dim, _DEVICE)
     episode_rewards: list[float] = []
     episode_count = 0
     global_step = 0
 
-    obs_np, _ = env.reset()
+    obs_np, current_event_info = env.reset()
     obs = torch.from_numpy(obs_np).float().to(_DEVICE)
     lstm_h = lstm_c = None
     ep_reward = 0.0
@@ -211,125 +259,161 @@ def train_ppo(
     step_bar = tqdm(total=tc.max_steps_per_episode, desc="  Episode steps", unit="step", dynamic_ncols=True, leave=False)
     _update_step_bar(step_bar, env)
 
-    while episode_count < total_episodes:
-        with torch.no_grad():
-            lstm_state = (lstm_h, lstm_c) if lstm_h is not None else None
-            action, log_prob, _, value, aux = policy.get_action_and_value(
-                obs.unsqueeze(0), lstm_state=lstm_state
-            )
-            lstm_h, lstm_c = aux["lstm_h"], aux["lstm_c"]
-            lifecycle_prob = aux["lifecycle_prob"].squeeze().item()
-
-        env.set_lifecycle_prob(lifecycle_prob)
-        action_np = action.squeeze(0).cpu().numpy()
-        action_np = np.clip(
-            action_np,
-            env.action_space.low,
-            env.action_space.high,
-        )
-
-        next_obs_np, reward, terminated, truncated, info = env.step(action_np)
-        done = terminated or truncated
-        ep_reward += reward
-        global_step += 1
-        ep_step += 1
-        step_bar.update(1)
-
-        buf.add(
-            obs=obs,
-            action=action.squeeze(0),
-            log_prob=log_prob.squeeze(),
-            reward=torch.tensor(reward, device=_DEVICE),
-            done=torch.tensor(float(done), device=_DEVICE),
-            value=value.squeeze(),
-        )
-
-        if done:
-            episode_count += 1
-            episode_rewards.append(ep_reward)
-            writer.add_scalar("train/episode_reward", ep_reward, episode_count)
-            writer.flush()
-
-            mean_r = float(np.mean(episode_rewards[-50:]))
-            ep_bar.set_postfix(reward=f"{ep_reward:.3f}", mean50=f"{mean_r:.3f}", step=global_step)
-            ep_bar.update(1)
-
-            if episode_count % 10 == 0:
-                log.info(
-                    "Stage %d | ep=%d/%d | reward=%.3f | mean_reward(50)=%.3f",
-                    stage, episode_count, total_episodes, ep_reward, mean_r,
-                )
-                writer.add_scalar("train/mean_reward_50", mean_r, episode_count)
-
-            obs_np, _ = env.reset()
-            obs = torch.from_numpy(obs_np).float().to(_DEVICE)
-            lstm_h = lstm_c = None
-            ep_reward = 0.0
-            ep_step = 0
-            step_bar.reset()
-            _update_step_bar(step_bar, env)
-        else:
-            obs = torch.from_numpy(next_obs_np).float().to(_DEVICE)
-
-        # PPO update when buffer is full
-        if buf.is_full():
+    try:
+        while episode_count < total_episodes:
             with torch.no_grad():
-                _, _, _, last_value, _ = policy.get_action_and_value(
-                    obs.unsqueeze(0),
-                    lstm_state=(lstm_h, lstm_c) if lstm_h is not None else None,
+                lstm_state = (lstm_h, lstm_c) if lstm_h is not None else None
+                action, log_prob, _, value, aux = policy.get_action_and_value(
+                    obs.unsqueeze(0), lstm_state=lstm_state
                 )
-            advantages, returns = compute_gae(
-                buf.rewards, buf.values, buf.dones,
-                last_value.item(), tc.gamma, tc.gae_lambda,
+                lstm_h, lstm_c = aux["lstm_h"], aux["lstm_c"]
+                lifecycle_prob = aux["lifecycle_prob"].squeeze().item()
+
+            env.set_lifecycle_prob(lifecycle_prob)
+            action_np = action.squeeze(0).cpu().numpy()
+            action_np = np.clip(
+                action_np,
+                env.action_space.low,
+                env.action_space.high,
             )
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-            # Flatten buffer for minibatch sampling
-            b_obs = buf.obs
-            b_actions = buf.actions
-            b_log_probs = buf.log_probs
-            b_returns = returns
-            b_advantages = advantages
+            next_obs_np, reward, terminated, truncated, info = env.step(action_np)
+            done = terminated or truncated
+            ep_reward += reward
+            global_step += 1
+            ep_step += 1
+            step_bar.update(1)
 
-            for _ in range(tc.n_epochs):
-                idxs = torch.randperm(tc.n_steps, device=_DEVICE)
-                for start in range(0, tc.n_steps, tc.batch_size):
-                    end = start + tc.batch_size
-                    mb_idx = idxs[start:end]
+            buf.add(
+                obs=obs,
+                action=action.squeeze(0),
+                log_prob=log_prob.squeeze(),
+                reward=torch.tensor(reward, device=_DEVICE),
+                done=torch.tensor(float(done), device=_DEVICE),
+                value=value.squeeze(),
+            )
 
-                    _, new_log_prob, entropy, new_value, _ = policy.get_action_and_value(
-                        b_obs[mb_idx], action=b_actions[mb_idx]
+            if done:
+                episode_count += 1
+                episode_rewards.append(ep_reward)
+                writer.add_scalar("train/episode_reward", ep_reward, episode_count)
+                writer.add_scalar("train/episode_steps", ep_step, episode_count)
+                writer.flush()
+
+                # Write episode history row to CSV
+                csv_writer.writerow([
+                    episode_count,
+                    global_step,
+                    current_event_info.get("event_id", "unknown"),
+                    round(ep_reward, 4),
+                    ep_step,
+                    stage,
+                    current_event_info.get("rotation_tier", "unknown"),
+                    current_event_info.get("length_mi"),
+                    current_event_info.get("n_timesteps"),
+                    current_event_info.get("max_rotation_score"),
+                ])
+                csv_fh.flush()
+
+                mean_r = float(np.mean(episode_rewards[-50:]))
+                ep_bar.set_postfix(
+                    reward=f"{ep_reward:.3f}",
+                    mean50=f"{mean_r:.3f}",
+                    event=current_event_info.get("event_id", "?")[:20],
+                    step=global_step,
+                )
+                ep_bar.update(1)
+
+                if episode_count % 10 == 0:
+                    log.info(
+                        "Stage %d | ep=%d/%d | event=%s | reward=%.3f | mean_reward(50)=%.3f",
+                        stage, episode_count, total_episodes,
+                        current_event_info.get("event_id", "?"),
+                        ep_reward, mean_r,
                     )
+                    writer.add_scalar("train/mean_reward_50", mean_r, episode_count)
 
-                    ratio = (new_log_prob - b_log_probs[mb_idx]).exp()
-                    adv = b_advantages[mb_idx]
+                # Periodic checkpoint
+                if episode_count % tc.checkpoint_interval == 0:
+                    periodic_ckpt = ckpt_dir / f"checkpoint_ep{episode_count}.pt"
+                    _save_checkpoint(policy, optimizer, stage, episode_count, global_step, run_name, periodic_ckpt)
 
-                    pg_loss1 = -adv * ratio
-                    pg_loss2 = -adv * torch.clamp(ratio, 1 - tc.clip_coef, 1 + tc.clip_coef)
-                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+                obs_np, current_event_info = env.reset()
+                obs = torch.from_numpy(obs_np).float().to(_DEVICE)
+                lstm_h = lstm_c = None
+                ep_reward = 0.0
+                ep_step = 0
+                step_bar.reset()
+                _update_step_bar(step_bar, env)
+            else:
+                obs = torch.from_numpy(next_obs_np).float().to(_DEVICE)
 
-                    v_loss = ((new_value - b_returns[mb_idx]) ** 2).mean()
-                    ent_loss = entropy.mean()
+            # PPO update when buffer is full
+            if buf.is_full():
+                with torch.no_grad():
+                    _, _, _, last_value, _ = policy.get_action_and_value(
+                        obs.unsqueeze(0),
+                        lstm_state=(lstm_h, lstm_c) if lstm_h is not None else None,
+                    )
+                advantages, returns = compute_gae(
+                    buf.rewards, buf.values, buf.dones,
+                    last_value.item(), tc.gamma, tc.gae_lambda,
+                )
+                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-                    loss = pg_loss + tc.vf_coef * v_loss - tc.ent_coef * ent_loss
+                # Flatten buffer for minibatch sampling
+                b_obs = buf.obs
+                b_actions = buf.actions
+                b_log_probs = buf.log_probs
+                b_returns = returns
+                b_advantages = advantages
 
-                    optimizer.zero_grad()
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(policy.parameters(), tc.max_grad_norm)
-                    optimizer.step()
+                for _ in range(tc.n_epochs):
+                    idxs = torch.randperm(tc.n_steps, device=_DEVICE)
+                    for start in range(0, tc.n_steps, tc.batch_size):
+                        end = start + tc.batch_size
+                        mb_idx = idxs[start:end]
 
-            writer.add_scalar("train/policy_loss", pg_loss.item(), global_step)
-            writer.add_scalar("train/value_loss", v_loss.item(), global_step)
-            writer.add_scalar("train/entropy", ent_loss.item(), global_step)
-            buf.reset()
+                        _, new_log_prob, entropy, new_value, _ = policy.get_action_and_value(
+                            b_obs[mb_idx], action=b_actions[mb_idx]
+                        )
 
-    ep_bar.close()
-    step_bar.close()
+                        ratio = (new_log_prob - b_log_probs[mb_idx]).exp()
+                        adv = b_advantages[mb_idx]
 
-    # Save final checkpoint
+                        pg_loss1 = -adv * ratio
+                        pg_loss2 = -adv * torch.clamp(ratio, 1 - tc.clip_coef, 1 + tc.clip_coef)
+                        pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+                        v_loss = ((new_value - b_returns[mb_idx]) ** 2).mean()
+                        ent_loss = entropy.mean()
+
+                        loss = pg_loss + tc.vf_coef * v_loss - tc.ent_coef * ent_loss
+
+                        optimizer.zero_grad()
+                        loss.backward()
+                        nn.utils.clip_grad_norm_(policy.parameters(), tc.max_grad_norm)
+                        optimizer.step()
+
+                writer.add_scalar("train/policy_loss", pg_loss.item(), global_step)
+                writer.add_scalar("train/value_loss", v_loss.item(), global_step)
+                writer.add_scalar("train/entropy", ent_loss.item(), global_step)
+                buf.reset()
+
+    except KeyboardInterrupt:
+        log.info("\nInterrupted at episode %d — saving checkpoint...", episode_count)
+        interrupt_ckpt = ckpt_dir / "checkpoint_interrupt.pt"
+        _save_checkpoint(policy, optimizer, stage, episode_count, global_step, run_name, interrupt_ckpt)
+        print(f"\n✓  Interrupted at episode {episode_count}/{total_episodes}. Checkpoint saved → {interrupt_ckpt}")
+    finally:
+        ep_bar.close()
+        step_bar.close()
+        csv_fh.close()
+        writer.close()
+        env.close()
+
+    # Save final checkpoint (only reached if loop completed normally)
     ckpt_path = ckpt_dir / "checkpoint_final.pt"
-    torch.save({"policy": policy.state_dict(), "stage": stage}, str(ckpt_path))
+    _save_checkpoint(policy, optimizer, stage, episode_count, global_step, run_name, ckpt_path)
     log.info("Stage %d complete. Checkpoint → %s", stage, ckpt_path)
-    writer.close()
-    env.close()
     return ckpt_path

@@ -58,6 +58,7 @@ train-stage1   = "training.stage1_follower:main"
 train-stage2   = "training.stage2_hunter:main"
 train-stage3   = "training.stage3_surveyor:main"
 evaluate       = "evaluation.evaluate:main"
+wall-of-shame  = "evaluation.wall_of_shame:main"
 predict        = "inference.predict:main"
 viz-events     = "viz.event_viewer:main"
 

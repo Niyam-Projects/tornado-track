@@ -89,6 +89,13 @@ class TornadoTrackEnv(gym.Env):
 
         self._index = self._index.reset_index(drop=True)
 
+        if len(self._index) == 0:
+            raise ValueError(
+                f"No events available for split='{split}' / min_tier={min_tier}. "
+                "Run `uv run scan-events` to rebuild index.parquet with the latest "
+                "tier classifications and split assignments."
+            )
+
         # Load normalization stats
         stats_file = Path(stats_path or cfg.data.stats_path)
         with open(stats_file) as f:
@@ -198,7 +205,14 @@ class TornadoTrackEnv(gym.Env):
         self._episode_step = 0
 
         obs = self._get_obs()
-        return obs, {}
+        info = {
+            "event_id": self._event.get("event_id", "unknown"),
+            "rotation_tier": self._event.get("rotation_tier", "unknown"),
+            "length_mi": self._event.get("length_mi"),
+            "n_timesteps": self._event.get("n_timesteps", 0),
+            "max_rotation_score": self._event.get("max_rotation_score"),
+        }
+        return obs, info
 
     # ------------------------------------------------------------------
     # Step
@@ -236,6 +250,8 @@ class TornadoTrackEnv(gym.Env):
         truncated = self._episode_step >= cfg.training.max_steps_per_episode
 
         info = {
+            "event_id": self._event.get("event_id", "unknown"),
+            "rotation_tier": self._event.get("rotation_tier", "unknown"),
             "t": self._t,
             "agent_y": self._agent_y,
             "agent_x": self._agent_x,
